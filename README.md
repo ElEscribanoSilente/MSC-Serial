@@ -1,263 +1,180 @@
-# MSC Serial v2.0
+# MSCS — Safe Serialization for Python
 
-> Reemplazo personal de `pickle` — seguro, comprimible y sin ejecución de código arbitrario.
+A secure, fast, binary serialization library. Drop-in replacement for `pickle` that **never executes arbitrary code** during deserialization.
 
----
+Built for AI/ML workflows — native support for **NumPy arrays** and **PyTorch tensors** with zero-copy performance.
 
-## ¿Por qué MSC Serial?
+## Why not pickle?
 
-| | `pickle` | `msc_serial` v2.0 |
-|---|---|---|
-| Seguridad al cargar | ❌ ejecuta código arbitrario | ✅ registry de clases seguras |
-| Compresión integrada | ❌ | ✅ zlib nativo |
-| Integridad de datos | ❌ | ✅ CRC32 opcional |
-| Refs circulares | ✅ | ✅ ref tracking por id |
-| Soporte numpy | parcial | ✅ nativo |
-| Formato auditable | ❌ opaco | ✅ header `MSCS` + versión + flags |
-| Límites de seguridad | ❌ | ✅ profundidad, tamaño, colecciones |
+```python
+# pickle: arbitrary code execution on load
+data = pickle.loads(untrusted_bytes)  # can run os.system("rm -rf /")
 
----
+# mscs: only reconstructs explicitly registered classes
+data = mscs.loads(untrusted_bytes)    # MSCSecurityError if class not registered
+```
 
-## Changelog v2.0
-
-- **Registry de clases seguras** — elimina `importlib` dinámico en deserialización; solo clases registradas con `@msc.register` se reconstruyen
-- **Tipos nuevos** — `complex`, `frozenset`, `bytearray`, `datetime`/`date`/`time`/`timedelta`, `Decimal`, `Enum`
-- **Referencias circulares** — tracking por `id(obj)` con tag `_REF`; objetos compartidos se serializan una sola vez
-- **Integridad CRC32** — `dumps(obj, with_crc=True)` detecta corrupción
-- **Límites configurables** — `MAX_DEPTH=256`, `MAX_COLLECTION=10M`, `MAX_STRING=100MB`, `MAX_SIZE=512MB`
-- **Excepciones tipadas** — `MSCEncodeError`, `MSCDecodeError`, `MSCSecurityError`
-- **Retrocompatibilidad** — carga automática de archivos v1.0
-- **Benchmark integrado** — `msc.benchmark(obj)` mide encode/decode/compresión
-
----
-
-## Instalación
-
-Sin dependencias externas. Copia `msc_serial.py` a tu proyecto y listo.
+## Install
 
 ```bash
-# opcional: numpy para arrays
-pip install numpy
+pip install mscs              # core (no dependencies)
+pip install mscs[numpy]       # + numpy support
+pip install mscs[torch]       # + numpy + PyTorch tensor support
+pip install mscs[all]         # everything
 ```
 
----
-
-## Uso rápido
+## Quick Start
 
 ```python
-import msc_serial as msc
+import mscs
 
-# ── Serializar / deserializar ──────────────────────────
-data = {"config": [1, 2, 3], "score": 0.97, "labels": {"a", "b"}}
+# Primitives, collections, nested structures — just works
+data = {"model": "v5.2", "lr": 0.001, "layers": [64, 128, 256]}
+encoded = mscs.dumps(data)
+decoded = mscs.loads(encoded)
 
-raw = msc.dumps(data)          # → bytes
-obj = msc.loads(raw)           # → objeto original
+# NumPy arrays
+import numpy as np
+arr = np.random.randn(100, 100).astype(np.float32)
+encoded = mscs.dumps(arr)  # 39 KB (vs 39.5 KB pickle)
 
-# ── Con verificación de integridad ─────────────────────
-raw = msc.dumps(data, with_crc=True)
-obj = msc.loads(raw)           # valida CRC32 automáticamente
+# PyTorch tensors — no .numpy() conversion needed
+import torch
+weights = torch.randn(256, 256)
+encoded = mscs.dumps(weights)  # safe, no pickle involved
 
-# ── Archivos ───────────────────────────────────────────
-with open("data.msc", "wb") as f:
-    msc.dump(data, f)
-
-with open("data.msc", "rb") as f:
-    obj = msc.load(f)
-
-# ── Con compresión zlib ────────────────────────────────
-with open("data.mscz", "wb") as f:
-    msc.dump_compressed(data, f)
-
-with open("data.mscz", "rb") as f:
-    obj = msc.load_compressed(f)
-
-# ── Inspeccionar sin deserializar ──────────────────────
-info = msc.inspect(raw)
-# {'valid': True, 'version': 2, 'size_bytes': 512, 'has_crc': True, 'root_tag': '0x8'}
+# Full model checkpoints
+checkpoint = {
+    "epoch": 100,
+    "model_state": {k: v for k, v in model.state_dict().items()},
+    "optimizer_lr": 0.0003,
+}
+mscs.dump(checkpoint, open("checkpoint.mscs", "wb"))
+restored = mscs.load(open("checkpoint.mscs", "rb"))
 ```
 
----
-
-## Registrar clases
-
-v2.0 requiere registrar clases explícitamente para deserialización segura. Sin registro, `loads()` lanza `MSCSecurityError`.
+## Custom Classes
 
 ```python
-import msc_serial as msc
+import mscs
 from dataclasses import dataclass
-from enum import Enum
 
-@msc.register
+@mscs.register
 @dataclass
-class Punto:
-    x: float
-    y: float
-    label: str = "p"
+class Config:
+    state_size: int = 256
+    lr: float = 0.001
 
-@msc.register
-class Color(Enum):
-    RED = 1
-    GREEN = 2
-    BLUE = 3
+config = Config(512, 0.0003)
+data = mscs.dumps(config)
+restored = mscs.loads(data)  # Config(state_size=512, lr=0.0003)
 
-# Serializar y reconstruir objetos seguros
-p = Punto(1.5, -2.3, "origen")
-raw = msc.dumps(p)
-obj = msc.loads(raw)           # → Punto(x=1.5, y=-2.3, label='origen')
+# Unregistered classes raise MSCSecurityError in strict mode
+mscs.loads(data_with_unknown_class)  # MSCSecurityError
 
-# Modo permisivo: clases no registradas → dict fallback
-obj = msc.loads(raw, strict=False)
-# → {'__class__': '...Punto', '__state__': {'x': 1.5, ...}}
+# Or get a dict fallback in non-strict mode
+mscs.loads(data_with_unknown_class, strict=False)  # {'__class__': '...', '__state__': {...}}
 ```
 
----
-
-## Tipos soportados
-
-| Tipo | Tag | Notas |
-|---|---|---|
-| `None`, `bool` | `0x00`, `0x01` | |
-| `int` | `0x02` | precisión arbitraria, little-endian |
-| `float` | `0x03` | 64-bit IEEE 754 (NaN, ±inf) |
-| `complex` | `0x0C` | **nuevo** — par de float64 |
-| `str` | `0x04` | UTF-8 |
-| `bytes`, `bytearray` | `0x05`, `0x14` | **bytearray nuevo** |
-| `Decimal` | `0x12` | **nuevo** — precisión arbitraria |
-| `list`, `tuple`, `set`, `frozenset` | `0x06`–`0x0D` | **frozenset nuevo** |
-| `dict` | `0x08` | anidados con ref tracking |
-| `datetime`, `date`, `time`, `timedelta` | `0x0E`–`0x11` | **nuevos** — ISO 8601 |
-| `Enum` | `0x13` | **nuevo** — requiere `@register` |
-| `numpy.ndarray` | `0x0A` | dtype + shape preservados |
-| `dataclass` | `0x0B` | requiere `@register` |
-| Objetos con `__dict__` / `__slots__` | `0x0B` | requiere `@register` |
-| Objetos con `__getstate__` / `__setstate__` | `0x0B` | protocolo pickle compatible |
-| Referencia circular | `0x15` | **nuevo** — puntero de 4 bytes |
-
----
-
-## API
+### Backward Compatibility with Renamed Classes
 
 ```python
-# ── Core ───────────────────────────────────────────────
-msc.dumps(obj, *, with_crc=False)      -> bytes
-msc.loads(data, *, strict=True)        -> Any
-msc.dump(obj, file, **kwargs)          -> None
-msc.load(file, **kwargs)               -> Any
-
-# ── Compresión ─────────────────────────────────────────
-msc.dump_compressed(obj, file, level=6, **kwargs) -> None
-msc.load_compressed(file, **kwargs)               -> Any
-
-# ── Registry ───────────────────────────────────────────
-msc.register(cls)              -> cls      # decorador
-
-# ── Utilidades ─────────────────────────────────────────
-msc.inspect(data)              -> dict     # metadata sin deserializar
-msc.benchmark(obj, rounds=100) -> dict     # rendimiento encode/decode
+mscs.register_alias("my_module.OldConfig", Config)
 ```
 
----
-
-## Seguridad
-
-**v1.0** usaba `importlib.import_module()` para reconstruir objetos — contradicción directa con la premisa de "sin ejecución de código arbitrario".
-
-**v2.0** corrige esto con un **registry explícito**:
-
-- Solo clases registradas con `@msc.register` se reconstruyen como objetos
-- `strict=True` (default): lanza `MSCSecurityError` si la clase no está registrada
-- `strict=False`: retorna `{'__class__': ..., '__state__': ...}` como fallback
-- Límites de profundidad, tamaño de colecciones y strings previenen memory bombs
-- Sin `importlib`, `eval`, `exec`, ni resolución dinámica de módulos
-
----
-
-## Formato del archivo
-
-```
-v1.0:  [MAGIC 4B][VERSION 1B][PAYLOAD...]
-        MSCS      \x01
-
-v2.0:  [MAGIC 4B][VERSION 1B][FLAGS 1B][PAYLOAD...][CRC32 4B opcional]
-        MSCS      \x02       bit0=crc
-```
-
-Los tags de tipo son un byte. Los enteros se codifican en little-endian con longitud variable. El ref tracking usa IDs incrementales de 4 bytes. Archivos v1.0 se cargan automáticamente.
-
----
-
-## Tests
-
-```bash
-python msc_serial.py
-```
-
-Salida esperada (43 tests):
-
-```
-── Primitivos ──
-✅ None  ✅ bool  ✅ int  ✅ float  ✅ NaN  ✅ inf
-✅ complex  ✅ str  ✅ bytes  ✅ bytearray  ✅ Decimal
-
-── Temporales ──
-✅ datetime  ✅ date  ✅ time  ✅ timedelta
-
-── Colecciones ──
-✅ list  ✅ tuple  ✅ set  ✅ frozenset  ✅ dict
-
-── Integridad CRC32 ──
-✅ dict con CRC  ✅ str con CRC  ✅ corrupción detectada
-
-── Referencias ──
-✅ refs compartidas  ✅ ref circular
-
-── Enum / Dataclass / Numpy / Seguridad ──
-✅ Enum  ✅ strict bloquea  ✅ strict=False fallback
-✅ numpy float32  ✅ numpy 100x100  ✅ dataclass registrado
-
-── Compresión ──
-✅ zlib (ratio ~3.7x)
-
-── Retrocompatibilidad ──
-✅ carga formato v1.0
-
-🎉 43/43 tests pasaron.
-```
-
----
-
-## Excepciones
-
-| Excepción | Cuándo |
-|---|---|
-| `MSCEncodeError` | Tipo no serializable, límite de profundidad/tamaño excedido |
-| `MSCDecodeError` | Datos corruptos, versión no soportada, CRC inválido, buffer truncado |
-| `MSCSecurityError` | Clase no registrada en modo `strict=True` |
-
-Todas heredan de `MSCError`.
-
----
-
-## Benchmark
+### Register All Classes in a Module
 
 ```python
-results = msc.benchmark(my_obj, rounds=500)
-# {
-#   'encode_ms': 0.052,
-#   'decode_ms': 0.065,
-#   'raw_bytes': 781,
-#   'compressed_bytes': 248,
-#   'compression_ratio': 3.15,
-#   'rounds': 500
-# }
+import my_models
+mscs.register_module(my_models)
 ```
 
----
+## Compression & Integrity
 
-## Licencia
+```python
+# zlib compression
+with open("data.mscs.z", "wb") as f:
+    mscs.dump_compressed(large_obj, f)
 
-MIT — ver [LICENSE](LICENSE)
+with open("data.mscs.z", "rb") as f:
+    obj = mscs.load_compressed(f)
 
----
+# CRC32 integrity check
+data = mscs.dumps(obj, with_crc=True)
+mscs.loads(data)  # verifies CRC, raises MSCDecodeError if corrupted
+```
 
-*Creado por **esraderey** · Co-autor **escribanosilente***
+## API Reference
+
+### Core
+
+| Function | Description |
+|----------|------------|
+| `dumps(obj, *, with_crc=False) -> bytes` | Serialize to bytes |
+| `loads(data, *, strict=True) -> Any` | Deserialize from bytes |
+| `dump(obj, file, **kwargs)` | Serialize to file (binary mode) |
+| `load(file, **kwargs) -> Any` | Deserialize from file |
+| `dump_compressed(obj, file, level=6)` | Serialize with zlib compression |
+| `load_compressed(file) -> Any` | Deserialize compressed data |
+
+### Registry
+
+| Function | Description |
+|----------|------------|
+| `register(cls) -> cls` | Register class as safe (also works as decorator) |
+| `register_alias(old_path, cls)` | Map old class path to new class |
+| `register_module(module) -> list` | Register all classes in a module |
+
+### Utilities
+
+| Function | Description |
+|----------|------------|
+| `inspect(data) -> dict` | Get metadata without deserializing |
+| `benchmark(obj, rounds=100) -> dict` | Measure encode/decode performance |
+| `copy(obj) -> obj` | Deep copy via serialization round-trip |
+
+## Supported Types
+
+| Type | Notes |
+|------|-------|
+| `None`, `bool`, `int`, `float`, `complex` | Arbitrary precision ints |
+| `str`, `bytes`, `bytearray` | UTF-8, ref-tracked |
+| `list`, `tuple`, `dict`, `set`, `frozenset` | Circular refs supported |
+| `datetime`, `date`, `time`, `timedelta` | ISO 8601 |
+| `Decimal`, `UUID`, `Path` | Lossless |
+| `Enum` | Must be registered |
+| `numpy.ndarray` | dtype whitelist enforced |
+| `torch.Tensor` | Auto CPU transfer, preserves requires_grad |
+| `dataclass`, `__slots__`, `__dict__` objects | Must be registered |
+
+## Performance
+
+Benchmarked on a state_dict with 4 tensors (~57K parameters):
+
+| Method | Roundtrip | Size | Safe |
+|--------|-----------|------|------|
+| **mscs** | **0.098 ms** | **65 KB** | **Yes** |
+| pickle | 0.580 ms | 68 KB | No (RCE) |
+| torch.save | 0.437 ms | 67 KB | No (RCE) |
+
+**5.9x faster than pickle, 4.1x faster than torch.save.**
+
+## Security Model
+
+1. **No code execution**: Deserialization only reconstructs data, never runs arbitrary code
+2. **Explicit registry**: Custom classes must be registered before deserialization
+3. **No dynamic imports**: Class names in the binary stream are only used as registry keys
+4. **NumPy dtype whitelist**: Blocks `object`, `void`, and structured dtypes
+5. **Configurable limits**: `MAX_DEPTH=256`, `MAX_SIZE=512MB`, `MAX_COLLECTION=10M`
+6. **Anti zip-bomb**: `load_compressed` validates both compressed and decompressed sizes
+7. **CRC32 integrity**: Optional checksum to detect corruption
+
+## Binary Format
+
+```
+[MSCS][version:1][flags:1][type_tag:1][...payload...]
+```
+
+## License
+
+MIT
