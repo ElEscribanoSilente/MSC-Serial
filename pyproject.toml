@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mscs"
-version = "2.2.0"
+version = "2.2.1"
 description = "Safe, fast serialization for Python — a secure replacement for pickle with native support for numpy arrays and PyTorch tensors."
 readme = "README.md"
 license = "MIT"
