@@ -39,6 +39,22 @@ Seguridad:
     todos los objetos serializados, los IDs no se reutilizan durante
     una sola llamada a encode().
 
+Changelog v2.3.0:
+  - ADD: HMAC-SHA256 autenticación criptográfica (hmac_key= en dumps/loads)
+  - ADD: Protección anti-downgrade (payload sin HMAC + clave = rechazado)
+  - ADD: Validación de trailing bytes (basura al final del payload = error)
+  - ADD: MAX_INT_BYTES=8192 — previene CPU exhaustion con ints enormes
+  - ADD: Rechazo de null bytes en Path (MSCSecurityError)
+  - ADD: Thread-safe registry con threading.Lock
+  - ADD: Test suite con pytest (169 tests) + fuzzing con Hypothesis
+  - FIX: Refs de tuple/frozenset desincronizadas encoder↔decoder
+  - FIX: id() reuse de dicts temporales en OBJ anidados (dataclasses)
+  - FIX: OBJ decoder no reservaba ref slot antes de decodear hijos
+  - FIX: Imports de numpy/torch movidos a top-level (elimina try/except
+         repetido en cada llamada a encode/decode)
+  - FIX: load_compressed usa read con límite (no lee archivo completo)
+  - Retrocompatible con payloads v2.2, v2.1, v2.0 y v1.0
+
 Changelog v2.2:
   - FIX: timedelta usa tag dedicado _TIMEDELTA2 (0x19) — elimina la
          ambiguedad heuristica entre formatos v2.0 y v2.1
@@ -78,6 +94,9 @@ Changelog v2.0:
 import struct
 import io
 import zlib
+import hmac
+import hashlib
+import threading
 import inspect as _inspect_mod
 import dataclasses
 from datetime import datetime, date, time, timedelta
@@ -87,13 +106,26 @@ from pathlib import Path
 from uuid import UUID
 from typing import Any, Type, Dict, Optional, Set, List
 
-__version__ = "2.2"
+# ─────────────── OPTIONAL DEPENDENCIES (top-level) ───────────────
+
+try:
+    import numpy as _np
+except ImportError:
+    _np = None
+
+try:
+    import torch as _torch
+except ImportError:
+    _torch = None
+
+__version__ = "2.3.0"
 __all__ = [
     "dump", "load", "dumps", "loads",
     "dump_compressed", "load_compressed",
     "register", "register_alias", "register_module",
     "inspect", "benchmark", "copy",
     "MSCError", "MSCEncodeError", "MSCDecodeError", "MSCSecurityError",
+    "MAX_INT_BYTES",
 ]
 
 # ─────────────────────── EXCEPTIONS ───────────────────────────────
@@ -159,6 +191,9 @@ MAX_SIZE        = 512 * 1024 * 1024  # 512 MB
 MAX_COMPRESSED  = 512 * 1024 * 1024  # 512 MB (compressed input limit, anti zip-bomb)
 MAX_COLLECTION  = 10_000_000
 MAX_STRING      = 100 * 1024 * 1024  # 100 MB
+MAX_INT_BYTES   = 8192              # ~19,700 dígitos decimales
+
+_HMAC_DIGEST_SIZE = 32  # SHA-256
 
 # ─────────────────── NUMPY DTYPE WHITELIST ────────────────────────
 
@@ -184,10 +219,11 @@ _RE_DTYPE_LONG  = _re.compile(r'(int|uint|float|complex|bool)\d*_?')
 
 def _is_safe_dtype(dtype_str: str) -> bool:
     """Valida que un dtype string sea seguro (no structured/object/void)."""
-    clean = dtype_str.strip().lower()
-    # Rechazar explícitamente tipos peligrosos
-    if clean in ('object', 'O', 'void', 'V'):
+    clean = dtype_str.strip()
+    # Rechazar explícitamente tipos peligrosos (case-insensitive)
+    if clean.lower() in ('object', 'o', 'void', 'v'):
         return False
+    clean = clean.lower()
     # Tipos simples directos
     if clean in _SAFE_NUMPY_DTYPES:
         return True
@@ -209,6 +245,7 @@ def _is_safe_dtype(dtype_str: str) -> bool:
 # ─────────────────────── REGISTRY ─────────────────────────────────
 
 _registry: Dict[str, Type] = {}
+_registry_lock = threading.Lock()
 
 
 def _class_key(cls: Type) -> str:
@@ -225,9 +262,13 @@ def register(cls: Type) -> Type:
         class MiObjeto:
             x: float
             y: float
+
+    NOTA: __setstate__ de clases registradas SE EJECUTA durante
+    deserialización. Solo registra clases confiables.
     """
     key = _class_key(cls)
-    _registry[key] = cls
+    with _registry_lock:
+        _registry[key] = cls
     return cls
 
 
@@ -238,6 +279,9 @@ def register_module(module) -> List[Type]:
 
         import my_models
         msc.register_module(my_models)
+
+    NOTA: __setstate__ de clases registradas SE EJECUTA durante
+    deserialización. Solo registra módulos confiables.
     """
     registered = []
     for name, obj in _inspect_mod.getmembers(module, _inspect_mod.isclass):
@@ -255,7 +299,8 @@ def register_alias(alias: str, cls: Type) -> None:
         # La clase se renombro de OldName a NewName
         msc.register_alias("my_module.OldName", NewName)
     """
-    _registry[alias] = cls
+    with _registry_lock:
+        _registry[alias] = cls
 
 
 def _is_registered(class_path: str) -> bool:
@@ -274,7 +319,7 @@ def _get_registered(class_path: str) -> Type:
 # ──────────────────────── ENCODER ─────────────────────────────────
 
 class _Encoder:
-    __slots__ = ('buf', 'depth', 'refs', 'ref_counter', 'use_refs')
+    __slots__ = ('buf', 'depth', 'refs', 'ref_counter', 'use_refs', '_pinned')
 
     def __init__(self, buf: io.BytesIO, *, use_refs: bool = True):
         self.buf = buf
@@ -282,6 +327,7 @@ class _Encoder:
         self.refs: Dict[int, int] = {}   # id(obj) -> ref_id
         self.ref_counter = 0
         self.use_refs = use_refs
+        self._pinned: list = []  # prevent GC of temporary objects (id reuse)
 
     def encode(self, obj: Any):
         self.depth += 1
@@ -334,6 +380,11 @@ class _Encoder:
                 buf.write(b'\x00')
             else:
                 n_bytes = (obj.bit_length() + 8) // 8
+                if n_bytes > MAX_INT_BYTES:
+                    raise MSCEncodeError(
+                        f"Entero demasiado grande: {n_bytes:,} bytes "
+                        f"(límite: {MAX_INT_BYTES:,})"
+                    )
                 raw = obj.to_bytes(n_bytes, 'little', signed=True)
                 buf.write(struct.pack('<H', len(raw)))
                 buf.write(raw)
@@ -489,56 +540,45 @@ class _Encoder:
 
         # ── Numpy ──
 
-        try:
-            import numpy as np
-            if isinstance(obj, np.ndarray):
-                if self._assign_ref(obj):
-                    return
-                dtype_s = str(obj.dtype)
-                if not _is_safe_dtype(dtype_s):
-                    raise MSCEncodeError(
-                        f"numpy dtype no permitido: {dtype_s!r}. "
-                        f"Solo se permiten dtypes numéricos simples."
-                    )
-                buf.write(_NDARRAY)
-                shape_s = 'x'.join(map(str, obj.shape)) if obj.shape else ''
-                meta = f"{dtype_s}|{shape_s}"
-                self._encode_str(meta)
-                raw = obj.tobytes()
-                self._write_length(len(raw), MAX_SIZE, "ndarray data")
-                buf.write(raw)
+        if _np is not None and isinstance(obj, _np.ndarray):
+            if self._assign_ref(obj):
                 return
-        except ImportError:
-            pass
+            dtype_s = str(obj.dtype)
+            if not _is_safe_dtype(dtype_s):
+                raise MSCEncodeError(
+                    f"numpy dtype no permitido: {dtype_s!r}. "
+                    f"Solo se permiten dtypes numéricos simples."
+                )
+            buf.write(_NDARRAY)
+            shape_s = 'x'.join(map(str, obj.shape)) if obj.shape else ''
+            meta = f"{dtype_s}|{shape_s}"
+            self._encode_str(meta)
+            raw = obj.tobytes()
+            self._write_length(len(raw), MAX_SIZE, "ndarray data")
+            buf.write(raw)
+            return
 
         # ── PyTorch Tensor ──
 
-        try:
-            import torch
-            if isinstance(obj, torch.Tensor):
-                if self._assign_ref(obj):
-                    return
-                # Mover a CPU y hacer contiguous para serializar
-                t = obj.detach().cpu().contiguous()
-                import numpy as np  # noqa: reusa np si ya importado por ndarray path
-                # Convertir a numpy para reutilizar la validación de dtype
-                arr = t.numpy()
-                dtype_s = str(arr.dtype)
-                if not _is_safe_dtype(dtype_s):
-                    raise MSCEncodeError(
-                        f"torch dtype no permitido: {obj.dtype} (numpy: {dtype_s!r})"
-                    )
-                buf.write(_TENSOR)
-                shape_s = 'x'.join(map(str, arr.shape)) if arr.shape else ''
-                requires_grad = '1' if obj.requires_grad else '0'
-                meta = f"{dtype_s}|{shape_s}|{requires_grad}"
-                self._encode_str(meta)
-                raw = arr.tobytes()
-                self._write_length(len(raw), MAX_SIZE, "tensor data")
-                buf.write(raw)
+        if _torch is not None and isinstance(obj, _torch.Tensor):
+            if self._assign_ref(obj):
                 return
-        except ImportError:
-            pass
+            t = obj.detach().cpu().contiguous()
+            arr = t.numpy()
+            dtype_s = str(arr.dtype)
+            if not _is_safe_dtype(dtype_s):
+                raise MSCEncodeError(
+                    f"torch dtype no permitido: {obj.dtype} (numpy: {dtype_s!r})"
+                )
+            buf.write(_TENSOR)
+            shape_s = 'x'.join(map(str, arr.shape)) if arr.shape else ''
+            requires_grad = '1' if obj.requires_grad else '0'
+            meta = f"{dtype_s}|{shape_s}|{requires_grad}"
+            self._encode_str(meta)
+            raw = arr.tobytes()
+            self._write_length(len(raw), MAX_SIZE, "tensor data")
+            buf.write(raw)
+            return
 
         # ── Objeto registrado ──
 
@@ -552,10 +592,6 @@ class _Encoder:
         if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
             state = {f.name: getattr(obj, f.name) for f in dataclasses.fields(obj)}
         elif hasattr(obj, '__slots__') and not hasattr(obj, '__dict__'):
-            # __slots__ sin __dict__ → extraer slots del MRO completo.
-            # Priorizado sobre __getstate__ porque Python 3.11+ añade un
-            # __getstate__ por defecto que retorna (None, slots_dict) — un
-            # formato que complica la deserialización innecesariamente.
             state = {}
             for cls in type(obj).__mro__:
                 for s in getattr(cls, '__slots__', ()):
@@ -565,14 +601,16 @@ class _Encoder:
             '__getstate__' in c.__dict__ for c in type(obj).__mro__[:-1]
             if c is not object
         ):
-            # Solo usar __getstate__ si fue definido explícitamente por el
-            # usuario, no el default de object.
             state = obj.__getstate__()
         elif hasattr(obj, '__dict__'):
             state = obj.__dict__
         else:
             raise MSCEncodeError(f"No se puede serializar: {type(obj)!r}")
 
+        # Pin temporary state dicts to prevent id() reuse. CPython may
+        # reuse the id of a temporary dict after it goes out of scope,
+        # causing false ref hits on subsequent OBJ state dicts.
+        self._pinned.append(state)
         self.encode(state)
 
     def _encode_str(self, s: str):
@@ -649,6 +687,11 @@ class _Decoder:
 
         if tag == _INT:
             n = struct.unpack('<H', self._read(2))[0]
+            if n > MAX_INT_BYTES:
+                raise MSCDecodeError(
+                    f"Entero demasiado grande: {n:,} bytes "
+                    f"(límite: {MAX_INT_BYTES:,}) en {self._path_str()}"
+                )
             return int.from_bytes(self._read(n), 'little', signed=True)
 
         if tag == _FLOAT:
@@ -688,6 +731,10 @@ class _Decoder:
         if tag == _PATH:
             n = self._read_length(MAX_STRING)
             s = self._read(n).decode('utf-8')
+            if '\x00' in s:
+                raise MSCSecurityError(
+                    f"Path contiene null bytes — posible ataque de inyección"
+                )
             return Path(s)
 
         if tag == _DATETIME:
@@ -749,18 +796,26 @@ class _Decoder:
 
         if tag == _TUPLE:
             n = self._read_length()
+            # Reserve ref slot BEFORE decoding children (matches encoder order)
+            ref_id = len(self.refs)
+            self.refs[ref_id] = None  # placeholder
             items = []
             for i in range(n):
                 self.path.append(f'({i})')
                 items.append(self.decode())
                 self.path.pop()
             t = tuple(items)
-            return self._store_ref(t)
+            self.refs[ref_id] = t  # fill placeholder
+            return t
 
         if tag == _FROZENSET:
             n = self._read_length()
+            # Reserve ref slot BEFORE decoding children (matches encoder order)
+            ref_id = len(self.refs)
+            self.refs[ref_id] = None  # placeholder
             items = frozenset(self.decode() for _ in range(n))
-            return self._store_ref(items)
+            self.refs[ref_id] = items  # fill placeholder
+            return items
 
         if tag == _SET:
             n = self._read_length()
@@ -782,9 +837,7 @@ class _Decoder:
             return result
 
         if tag == _NDARRAY:
-            try:
-                import numpy as np
-            except ImportError:
+            if _np is None:
                 raise MSCDecodeError("numpy requerido para deserializar arrays")
             meta = self._decode_str()
             dtype_str, shape_str = meta.split('|')
@@ -795,14 +848,11 @@ class _Decoder:
             shape = tuple(int(x) for x in shape_str.split('x')) if shape_str else ()
             n = self._read_length(MAX_SIZE)
             raw = self._read(n)
-            arr = np.frombuffer(raw, dtype=np.dtype(dtype_str)).copy().reshape(shape)
+            arr = _np.frombuffer(raw, dtype=_np.dtype(dtype_str)).copy().reshape(shape)
             return self._store_ref(arr)
 
         if tag == _TENSOR:
-            try:
-                import torch
-                import numpy as np
-            except ImportError:
+            if _torch is None or _np is None:
                 raise MSCDecodeError("torch y numpy requeridos para deserializar tensores")
             meta = self._decode_str()
             parts = meta.split('|')
@@ -815,13 +865,17 @@ class _Decoder:
             shape = tuple(int(x) for x in shape_str.split('x')) if shape_str else ()
             n = self._read_length(MAX_SIZE)
             raw = self._read(n)
-            arr = np.frombuffer(raw, dtype=np.dtype(dtype_str)).copy().reshape(shape)
-            t = torch.from_numpy(arr)
+            arr = _np.frombuffer(raw, dtype=_np.dtype(dtype_str)).copy().reshape(shape)
+            t = _torch.from_numpy(arr)
             if requires_grad:
                 t = t.requires_grad_(True)
             return self._store_ref(t)
 
         if tag == _OBJ:
+            # Reserve ref slot BEFORE decoding children (matches encoder order)
+            ref_id = len(self.refs)
+            self.refs[ref_id] = None  # placeholder
+
             class_path = self._decode_str()
             self.path.append(class_path.rsplit('.', 1)[-1])
             state = self.decode()
@@ -832,7 +886,9 @@ class _Decoder:
             elif _is_registered(class_path):
                 cls = _registry[class_path]
             else:
-                return {'__class__': class_path, '__state__': state}
+                fallback = {'__class__': class_path, '__state__': state}
+                self.refs[ref_id] = fallback
+                return fallback
 
             obj = cls.__new__(cls)
             if dataclasses.is_dataclass(cls):
@@ -849,9 +905,9 @@ class _Decoder:
             elif hasattr(obj, '__dict__'):
                 obj.__dict__.update(state)
             else:
-                # Fallback: intentar setattr (cubre slots con __dict__ mixto)
                 for k, v in state.items():
                     setattr(obj, k, v)
+            self.refs[ref_id] = obj
             return obj
 
         raise MSCDecodeError(
@@ -871,11 +927,29 @@ class _Decoder:
 
 # ──────────────────────── PUBLIC API ──────────────────────────────
 
-def dumps(obj: Any, *, with_crc: bool = False) -> bytes:
-    """Serializa obj a bytes."""
+def dumps(obj: Any, *, with_crc: bool = False,
+          hmac_key: Optional[bytes] = None) -> bytes:
+    """
+    Serializa obj a bytes.
+
+    with_crc: añade CRC32 para detectar corrupción accidental.
+    hmac_key: si se proporciona, añade HMAC-SHA256 para autenticación
+              criptográfica. Verificado en loads() con la misma clave.
+              Mutuamente exclusivo con with_crc (HMAC es estrictamente
+              superior).
+    """
+    if with_crc and hmac_key is not None:
+        raise MSCEncodeError(
+            "with_crc y hmac_key son mutuamente exclusivos. "
+            "HMAC ya incluye protección de integridad."
+        )
     buf = io.BytesIO()
     buf.write(MAGIC + VERSION)
-    flags = 0x01 if with_crc else 0x00
+    flags = 0x00
+    if with_crc:
+        flags |= 0x01
+    if hmac_key is not None:
+        flags |= 0x02
     buf.write(struct.pack('B', flags))
     enc = _Encoder(buf)
     enc.encode(obj)
@@ -883,51 +957,105 @@ def dumps(obj: Any, *, with_crc: bool = False) -> bytes:
     if with_crc:
         crc = zlib.crc32(data) & 0xFFFFFFFF
         data += struct.pack('<I', crc)
+    if hmac_key is not None:
+        mac = hmac.new(hmac_key, data, hashlib.sha256).digest()
+        data += mac
     return data
 
 
-def loads(data: bytes, *, strict: bool = True) -> Any:
+def loads(data: bytes, *, strict: bool = True,
+          hmac_key: Optional[bytes] = None) -> Any:
     """
     Deserializa bytes a objeto.
+
     strict=True: solo reconstruye clases registradas (lanza MSCSecurityError).
     strict=False: clases no registradas retornan dict fallback.
+    hmac_key: si se proporciona, verifica HMAC-SHA256 antes de deserializar.
+              Lanza MSCSecurityError si la firma no coincide.
     """
     if len(data) < 6:
         raise MSCDecodeError("Datos demasiado cortos para ser MSC Serial")
-    buf = io.BytesIO(data)
-    magic = buf.read(4)
-    if magic != MAGIC:
-        raise MSCDecodeError(f"Magic bytes inválidos: {magic!r}")
-    ver = buf.read(1)
+    if data[:4] != MAGIC:
+        raise MSCDecodeError(f"Magic bytes inválidos: {data[:4]!r}")
+    ver = data[4:5]
+
     if ver == b'\x01':
-        # Retrocompatibilidad con v1.0 (sin flags)
+        # Retrocompatibilidad con v1.0 (sin flags, sin trailing validation)
+        buf = io.BytesIO(data)
+        buf.seek(5)
         dec = _Decoder(buf, strict=False)
         return dec.decode()
+
     if ver != VERSION:
         raise MSCDecodeError(f"Versión no soportada: {ver!r}")
-    flags = struct.unpack('B', buf.read(1))[0]
+
+    flags = data[5]
     has_crc = bool(flags & 0x01)
+    has_hmac = bool(flags & 0x02)
+
+    # ── Determinar dónde termina el payload real ──
+    decode_data = data
+    if has_hmac:
+        if len(data) < 6 + _HMAC_DIGEST_SIZE:
+            raise MSCDecodeError("Datos truncados: falta HMAC")
+        stored_mac = data[-_HMAC_DIGEST_SIZE:]
+        payload_for_mac = data[:-_HMAC_DIGEST_SIZE]
+        if hmac_key is None:
+            raise MSCSecurityError(
+                "Payload firmado con HMAC pero no se proporcionó hmac_key"
+            )
+        computed_mac = hmac.new(hmac_key, payload_for_mac, hashlib.sha256).digest()
+        if not hmac.compare_digest(stored_mac, computed_mac):
+            raise MSCSecurityError("HMAC-SHA256 no coincide: payload manipulado o clave incorrecta")
+        decode_data = payload_for_mac
+    elif hmac_key is not None:
+        raise MSCSecurityError(
+            "Se proporcionó hmac_key pero el payload no tiene flag HMAC. "
+            "Posible ataque de downgrade."
+        )
+
     if has_crc:
-        payload = data[:-4]
-        stored_crc = struct.unpack('<I', data[-4:])[0]
-        computed_crc = zlib.crc32(payload) & 0xFFFFFFFF
+        if len(decode_data) < 10:  # 6 header + 4 crc minimum
+            raise MSCDecodeError("Datos truncados: falta CRC")
+        crc_payload = decode_data[:-4]
+        stored_crc = struct.unpack('<I', decode_data[-4:])[0]
+        computed_crc = zlib.crc32(crc_payload) & 0xFFFFFFFF
         if stored_crc != computed_crc:
             raise MSCDecodeError(
                 f"CRC32 no coincide: almacenado={stored_crc:#010x}, "
                 f"calculado={computed_crc:#010x}"
             )
+        # El decoder no debe leer los 4 bytes del CRC
+        end_pos = len(decode_data) - 4
+    else:
+        end_pos = len(decode_data)
+
+    buf = io.BytesIO(decode_data)
+    buf.seek(6)  # skip header
     dec = _Decoder(buf, strict=strict)
-    return dec.decode()
+    result = dec.decode()
+
+    # ── Validar que no hay trailing bytes ──
+    consumed = buf.tell()
+    if consumed != end_pos:
+        raise MSCDecodeError(
+            f"Trailing bytes: se consumieron {consumed} de {end_pos} bytes. "
+            f"Payload posiblemente corrupto o manipulado."
+        )
+
+    return result
 
 
-def dump(obj: Any, file, **kwargs) -> None:
+def dump(obj: Any, file, *, with_crc: bool = False,
+         hmac_key: Optional[bytes] = None) -> None:
     """Serializa obj al archivo (modo binario)."""
-    file.write(dumps(obj, **kwargs))
+    file.write(dumps(obj, with_crc=with_crc, hmac_key=hmac_key))
 
 
-def load(file, **kwargs) -> Any:
+def load(file, *, strict: bool = True,
+         hmac_key: Optional[bytes] = None) -> Any:
     """Deserializa desde archivo (modo binario)."""
-    return loads(file.read(), **kwargs)
+    return loads(file.read(), strict=strict, hmac_key=hmac_key)
 
 
 def dump_compressed(obj: Any, file, level: int = 6, **kwargs) -> None:
@@ -943,7 +1071,7 @@ def load_compressed(file, **kwargs) -> Any:
     orig_size = struct.unpack('<I', file.read(4))[0]
     if orig_size > MAX_SIZE:
         raise MSCDecodeError(f"Tamaño original excede límite: {orig_size:,}")
-    compressed = file.read()
+    compressed = file.read(MAX_COMPRESSED + 1)
     if len(compressed) > MAX_COMPRESSED:
         raise MSCDecodeError(
             f"Datos comprimidos exceden límite: {len(compressed):,} > {MAX_COMPRESSED:,}"

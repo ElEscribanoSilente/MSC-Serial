@@ -1,9 +1,9 @@
 """
-MSC Serial v2.2 — Benchmark completo
+MSCS v2.2 — Benchmark completo
 =====================================
-Compara MSC Serial vs pickle vs torch.save vs json en múltiples escenarios.
+Compara MSCS vs pickle vs torch.save vs json en múltiples escenarios.
 
-Ejecutar: python msc_serial/benchmark.py
+Ejecutar: python tests/benchmark.py
 """
 import sys
 import os
@@ -16,9 +16,9 @@ import zlib
 import dataclasses
 from pathlib import Path
 
-# Importar MSC Serial desde el mismo directorio
-sys.path.insert(0, os.path.dirname(__file__))
-import msc_serial as msc
+# Importar mscs desde src/
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+import mscs as msc
 
 import numpy as np
 import torch
