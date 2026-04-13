@@ -27,7 +27,7 @@ from mscs._core import (
     MAX_COMPRESSED, _NONE, _BOOL, _INT, _FLOAT, _STR, _BYTES,
     _LIST, _TUPLE, _DICT, _SET, _NDARRAY, _OBJ, _COMPLEX,
     _FROZENSET, _DATETIME, _DATE, _TIME, _TIMEDELTA, _DECIMAL,
-    _ENUM, _BYTEARRAY, _REF, _UUID, _PATH, _TENSOR, _TIMEDELTA2,
+    _ENUM, _BYTEARRAY, _REF, _UUID, _PATH, _TENSOR, _TIMEDELTA2, _DEQUE,
     _is_safe_dtype, _registry,
 )
 
@@ -459,6 +459,22 @@ class TestDtypeSecurity:
     def test_dangerous_dtypes_blocked(self, dtype):
         assert _is_safe_dtype(dtype) is False
 
+    @pytest.mark.parametrize("dtype", [
+        "U8", "U16", "U32",        # unicode string shorthand (UPPERCASE)
+        "S8", "S16", "S32",        # byte string shorthand (UPPERCASE)
+        "V8", "V16",               # void shorthand (UPPERCASE)
+        "<U8", ">S16", "|V32",     # with byteorder prefix
+        "v8", "v16",               # lowercase void shorthand
+    ])
+    def test_string_unicode_void_shorthand_blocked(self, dtype):
+        """SEC-03: S<n>/U<n>/V<n> shorthand dtypes must be blocked."""
+        assert _is_safe_dtype(dtype) is False
+
+    @pytest.mark.parametrize("dtype", ["u1", "u2", "u4", "u8"])
+    def test_unsigned_int_shorthand_accepted(self, dtype):
+        """Ensure lowercase u<n> (uint) is NOT blocked by S/U/V filter."""
+        assert _is_safe_dtype(dtype) is True
+
 
 class TestPathSecurity:
     def test_null_byte_rejected(self):
@@ -815,3 +831,225 @@ class TestTrailingBytes:
         tampered = data + b'\xFF'
         with pytest.raises(mscs.MSCDecodeError):
             mscs.loads(tampered, strict=False)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# BUG 1 — __getstate__/__setstate__ ON DATACLASS
+# ═══════════════════════════════════════════════════════════════════
+
+class TestDataclassGetstate:
+    def test_dataclass_with_getstate_roundtrip(self):
+        """Dataclass with __getstate__/__setstate__ must use them over field walking."""
+        from collections import deque
+
+        @mscs.register
+        @dataclasses.dataclass
+        class FooDC:
+            x: int = 1
+            q: object = dataclasses.field(default_factory=lambda: deque([1, 2, 3]))
+
+            def __getstate__(self):
+                return {'x': self.x, 'q': list(self.q)}
+
+            def __setstate__(self, s):
+                object.__setattr__(self, 'x', s['x'])
+                object.__setattr__(self, 'q', deque(s['q']))
+
+        f = FooDC()
+        data = mscs.dumps(f)
+        result = mscs.loads(data)
+        assert result.x == 1
+        assert list(result.q) == [1, 2, 3]
+        assert isinstance(result.q, deque)
+
+    def test_dataclass_without_getstate_still_works(self):
+        """Normal dataclass (no __getstate__) should still use field walking."""
+        @mscs.register
+        @dataclasses.dataclass
+        class BarDC:
+            a: int = 10
+            b: str = "hello"
+
+        obj = BarDC(42, "world")
+        data = mscs.dumps(obj)
+        result = mscs.loads(data)
+        assert result.a == 42
+        assert result.b == "world"
+
+    def test_dataclass_getstate_transforms_state(self):
+        """__getstate__ that transforms data must be respected."""
+        @mscs.register
+        @dataclasses.dataclass
+        class TransformDC:
+            values: list = dataclasses.field(default_factory=lambda: [1, 2, 3])
+
+            def __getstate__(self):
+                return {'values': [v * 10 for v in self.values]}
+
+            def __setstate__(self, s):
+                object.__setattr__(self, 'values', [v // 10 for v in s['values']])
+
+        obj = TransformDC([5, 6, 7])
+        data = mscs.dumps(obj)
+        result = mscs.loads(data)
+        assert result.values == [5, 6, 7]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# BUG 2 — DEQUE NATIVE SUPPORT
+# ═══════════════════════════════════════════════════════════════════
+
+class TestDequeRoundtrip:
+    def test_deque_basic(self):
+        from collections import deque
+        val = deque([1, 2, 3])
+        data = mscs.dumps(val)
+        result = mscs.loads(data, strict=False)
+        assert isinstance(result, deque)
+        assert list(result) == [1, 2, 3]
+        assert result.maxlen is None
+
+    def test_deque_with_maxlen(self):
+        from collections import deque
+        val = deque([1, 2, 3], maxlen=5)
+        data = mscs.dumps(val)
+        result = mscs.loads(data, strict=False)
+        assert isinstance(result, deque)
+        assert list(result) == [1, 2, 3]
+        assert result.maxlen == 5
+
+    def test_deque_empty(self):
+        from collections import deque
+        val = deque()
+        data = mscs.dumps(val)
+        result = mscs.loads(data, strict=False)
+        assert isinstance(result, deque)
+        assert len(result) == 0
+        assert result.maxlen is None
+
+    def test_deque_empty_with_maxlen(self):
+        from collections import deque
+        val = deque(maxlen=10)
+        data = mscs.dumps(val)
+        result = mscs.loads(data, strict=False)
+        assert isinstance(result, deque)
+        assert len(result) == 0
+        assert result.maxlen == 10
+
+    def test_deque_nested(self):
+        from collections import deque
+        val = {"history": deque([1, 2, 3], maxlen=100), "data": [4, 5]}
+        data = mscs.dumps(val)
+        result = mscs.loads(data, strict=False)
+        assert isinstance(result["history"], deque)
+        assert list(result["history"]) == [1, 2, 3]
+        assert result["history"].maxlen == 100
+        assert result["data"] == [4, 5]
+
+    def test_deque_mixed_types(self):
+        from collections import deque
+        val = deque(["hello", 42, 3.14, None, True])
+        data = mscs.dumps(val)
+        result = mscs.loads(data, strict=False)
+        assert list(result) == ["hello", 42, 3.14, None, True]
+
+    def test_deque_circular_ref(self):
+        from collections import deque
+        d = deque([1, 2])
+        d.append(d)
+        data = mscs.dumps(d)
+        result = mscs.loads(data, strict=False)
+        assert result[0] == 1
+        assert result[1] == 2
+        assert result[2] is result
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SECURITY: DEQUE ADVERSARIAL PAYLOADS
+# ═══════════════════════════════════════════════════════════════════
+
+class TestDequeSecurity:
+    def _craft_deque_payload(self, maxlen_raw, count, items_data=b''):
+        """Build a raw deque payload with arbitrary maxlen and count."""
+        payload = HEADER + _DEQUE
+        payload += struct.pack('<i', maxlen_raw)
+        payload += struct.pack('<I', count)
+        payload += items_data
+        return payload
+
+    def test_negative_maxlen_rejected(self):
+        """SEC-01: maxlen < -1 must be rejected."""
+        payload = self._craft_deque_payload(-2, 0)
+        with pytest.raises(mscs.MSCDecodeError, match="maxlen"):
+            mscs.loads(payload, strict=False)
+
+    def test_very_negative_maxlen_rejected(self):
+        """SEC-01: maxlen = -1000 must be rejected."""
+        payload = self._craft_deque_payload(-1000, 0)
+        with pytest.raises(mscs.MSCDecodeError, match="maxlen"):
+            mscs.loads(payload, strict=False)
+
+    def test_min_int32_maxlen_rejected(self):
+        """SEC-01: maxlen = INT32_MIN must be rejected."""
+        payload = self._craft_deque_payload(-(2**31), 0)
+        with pytest.raises(mscs.MSCDecodeError, match="maxlen"):
+            mscs.loads(payload, strict=False)
+
+    def test_maxlen0_with_items_rejected(self):
+        """SEC-02: maxlen=0 with count>0 must be rejected (CPU waste DoS)."""
+        # Craft: maxlen=0, count=100, 100 None items
+        items = _NONE * 100
+        payload = self._craft_deque_payload(0, 100, items)
+        with pytest.raises(mscs.MSCDecodeError, match="excede maxlen"):
+            mscs.loads(payload, strict=False)
+
+    def test_maxlen_less_than_count_rejected(self):
+        """SEC-02: count > maxlen must be rejected (CPU waste DoS)."""
+        # maxlen=2, count=100 — would decode 100 items keeping only 2
+        items = _NONE * 100
+        payload = self._craft_deque_payload(2, 100, items)
+        with pytest.raises(mscs.MSCDecodeError, match="excede maxlen"):
+            mscs.loads(payload, strict=False)
+
+    def test_maxlen_equals_count_accepted(self):
+        """maxlen == count is valid and must work."""
+        from collections import deque
+        d = deque([1, 2, 3], maxlen=3)
+        data = mscs.dumps(d)
+        result = mscs.loads(data, strict=False)
+        assert list(result) == [1, 2, 3]
+        assert result.maxlen == 3
+
+    def test_maxlen_none_unlimited_accepted(self):
+        """maxlen=-1 (None/unlimited) with any count must work."""
+        from collections import deque
+        d = deque(range(100))
+        data = mscs.dumps(d)
+        result = mscs.loads(data, strict=False)
+        assert len(result) == 100
+        assert result.maxlen is None
+
+    def test_deque_count_exceeds_max_collection(self):
+        """Deque count > MAX_COLLECTION must be rejected."""
+        from mscs._core import MAX_COLLECTION
+        payload = self._craft_deque_payload(-1, MAX_COLLECTION + 1)
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(payload, strict=False)
+
+    def test_deque_truncated_maxlen(self):
+        """Truncated deque (missing maxlen bytes) must error."""
+        payload = HEADER + _DEQUE + b'\x00\x00'  # only 2 bytes, need 4
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(payload, strict=False)
+
+    def test_deque_truncated_count(self):
+        """Truncated deque (has maxlen but no count) must error."""
+        payload = HEADER + _DEQUE + struct.pack('<i', -1)  # maxlen only
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(payload, strict=False)
+
+    def test_deque_truncated_items(self):
+        """Deque that claims 5 items but has none must error."""
+        payload = self._craft_deque_payload(-1, 5)
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(payload, strict=False)

@@ -1,6 +1,6 @@
 # MSCS — Safe Serialization for Python
 
-**v2.3.0** | [Changelog](CHANGELOG.md) | [PyPI](https://pypi.org/project/mscs/)
+**v2.4.0** | [Changelog](CHANGELOG.md) | [PyPI](https://pypi.org/project/mscs/)
 
 > **Status: Beta** — API is stable but the format may evolve. Not yet battle-tested in large-scale production.
 
@@ -167,7 +167,7 @@ mscs.loads(unsigned_data, hmac_key=key)  # MSCSecurityError: anti-downgrade prot
 |------|-------|
 | `None`, `bool`, `int`, `float`, `complex` | Ints up to 8192 bytes (~19,700 digits) |
 | `str`, `bytes`, `bytearray` | UTF-8, ref-tracked |
-| `list`, `tuple`, `dict`, `set`, `frozenset` | Circular refs supported |
+| `list`, `tuple`, `dict`, `set`, `frozenset`, `deque` | Circular refs supported; `deque` preserves `maxlen` |
 | `datetime`, `date`, `time`, `timedelta` | ISO 8601 |
 | `Decimal`, `UUID`, `Path` | Lossless |
 | `Enum` | Must be registered |
@@ -262,6 +262,7 @@ CRC32 and HMAC are mutually exclusive (HMAC is strictly superior).
 | 0x17 | Path | `<I>` str len + UTF-8 path string |
 | 0x18 | Tensor | str(meta) + `<I>` data size + raw buffer |
 | 0x19 | timedelta2 | `<iiI>` days, seconds, microseconds |
+| 0x1A | deque | `<i>` maxlen (-1 if None) + `<I>` item count + items |
 
 **ndarray meta**: `"{dtype}|{shape}"` where shape is `"dim0xdim1x..."` (e.g., `"float32|100x100"`).
 

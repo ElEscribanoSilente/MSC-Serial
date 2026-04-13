@@ -2,6 +2,20 @@
 
 All notable changes to MSCS are documented here.
 
+## [2.4.0] — 2026-04-12
+
+### Added
+- **Native `collections.deque` support** — tag `0x1A`. Preserves `maxlen` and supports circular references. Format: `<i>` maxlen (-1 if None) + `<I>` item count + items.
+
+### Fixed
+- **`__getstate__`/`__setstate__` ignored on dataclasses** — dataclasses that defined `__getstate__` were serialized by walking their fields directly (via `dataclasses.fields()`), which caused `MSCEncodeError` if any field contained unsupported types (e.g., `deque`). The encoder and decoder now check for `__getstate__`/`__setstate__` **before** checking `is_dataclass`. Priority order: `__getstate__`/`__setstate__` > dataclass fields > `__slots__` > `__dict__`.
+
+### Backward Compatibility
+- Wire format is fully backward compatible. Payloads from v2.3, v2.2, v2.1, v2.0, and v1.0 load without changes.
+- The `deque` tag (`0x1A`) is new — payloads containing `deque` cannot be read by v2.3 or earlier (forward compatibility is not guaranteed).
+
+---
+
 ## [2.3.0] — 2026-04-06
 
 ### Added

@@ -16,7 +16,7 @@ from mscs._core import (
     _LIST, _TUPLE, _DICT, _SET, _NDARRAY, _OBJ, _COMPLEX,
     _FROZENSET, _DATETIME, _DATE, _TIME, _TIMEDELTA, _DECIMAL,
     _ENUM, _BYTEARRAY, _REF, _UUID, _PATH, _TENSOR, _TIMEDELTA2,
-    MAX_DEPTH, MAX_SIZE, MAX_COLLECTION, MAX_STRING, _Encoder,
+    _DEQUE, MAX_DEPTH, MAX_SIZE, MAX_COLLECTION, MAX_STRING, _Encoder,
     _registry, _is_safe_dtype,
 )
 
@@ -361,6 +361,49 @@ def main():
         dec = mscs.loads(legacy_td, strict=False)
         assert dec == timedelta(days=5, seconds=3661, microseconds=123456)
     test_ok("legacy TIMEDELTA tag still decodes", test_td_legacy)
+
+    # ═══════════════ 16. DEQUE SECURITY (v2.4.0) ═══════════════
+    print("\n  -- 16. Deque adversarial payloads --")
+
+    def craft_deque(maxlen_raw, count, items=b''):
+        p = HEADER + _DEQUE
+        p += struct.pack('<i', maxlen_raw)
+        p += struct.pack('<I', count)
+        p += items
+        return p
+
+    test_reject("deque maxlen=-2", lambda: mscs.loads(craft_deque(-2, 0), strict=False))
+    test_reject("deque maxlen=-1000", lambda: mscs.loads(craft_deque(-1000, 0), strict=False))
+    test_reject("deque maxlen=INT32_MIN", lambda: mscs.loads(craft_deque(-(2**31), 0), strict=False))
+    test_reject("deque maxlen=0, count=100 (CPU waste)", lambda: mscs.loads(craft_deque(0, 100, _NONE * 100), strict=False))
+    test_reject("deque maxlen=2, count=100 (CPU waste)", lambda: mscs.loads(craft_deque(2, 100, _NONE * 100), strict=False))
+    test_reject("deque count > MAX_COLLECTION", lambda: mscs.loads(craft_deque(-1, MAX_COLLECTION + 1), strict=False))
+    test_reject("deque truncated (no maxlen)", lambda: mscs.loads(HEADER + _DEQUE + b'\x00\x00', strict=False))
+    test_reject("deque truncated (no count)", lambda: mscs.loads(HEADER + _DEQUE + struct.pack('<i', -1), strict=False))
+    test_reject("deque truncated items", lambda: mscs.loads(craft_deque(-1, 5), strict=False))
+
+    def test_deque_valid():
+        from collections import deque
+        d = deque([1, 2, 3], maxlen=5)
+        data = mscs.dumps(d)
+        r = mscs.loads(data, strict=False)
+        assert list(r) == [1, 2, 3] and r.maxlen == 5
+    test_ok("deque valid roundtrip (maxlen=5, 3 items)", test_deque_valid)
+
+    # ═══════════════ 17. DTYPE S/U/V BYPASS (v2.4.0 fix) ═══════════════
+    print("\n  -- 17. Dtype S/U/V shorthand bypass --")
+
+    test_ok("dtype U8 blocked (unicode)", lambda: assert_true(not _is_safe_dtype('U8')))
+    test_ok("dtype U16 blocked", lambda: assert_true(not _is_safe_dtype('U16')))
+    test_ok("dtype S8 blocked (string)", lambda: assert_true(not _is_safe_dtype('S8')))
+    test_ok("dtype S16 blocked", lambda: assert_true(not _is_safe_dtype('S16')))
+    test_ok("dtype V8 blocked (void)", lambda: assert_true(not _is_safe_dtype('V8')))
+    test_ok("dtype <U8 blocked (with byteorder)", lambda: assert_true(not _is_safe_dtype('<U8')))
+    test_ok("dtype >S16 blocked", lambda: assert_true(not _is_safe_dtype('>S16')))
+    test_ok("dtype v8 blocked (void lowercase)", lambda: assert_true(not _is_safe_dtype('v8')))
+    test_ok("dtype u8 safe (uint64, not unicode)", lambda: assert_true(_is_safe_dtype('u8')))
+    test_ok("dtype u2 safe (uint16)", lambda: assert_true(_is_safe_dtype('u2')))
+    test_ok("dtype uint8 safe (full name)", lambda: assert_true(_is_safe_dtype('uint8')))
 
     # ═══════════════ RESULTS ═══════════════
     print("\n" + "=" * 70)

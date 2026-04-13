@@ -1,11 +1,11 @@
 """
-MSC Serial v2.2
+MSC Serial v2.4
 ===============
 Reemplazo personal y seguro de pickle.
 
-Soporta: dict, list, tuple, set, frozenset, str, int, float, complex,
-         bool, None, bytes, bytearray, datetime, date, time, timedelta,
-         Decimal, UUID, Path, Enum, numpy arrays, torch.Tensor,
+Soporta: dict, list, tuple, set, frozenset, deque, str, int, float,
+         complex, bool, None, bytes, bytearray, datetime, date, time,
+         timedelta, Decimal, UUID, Path, Enum, numpy arrays, torch.Tensor,
          dataclasses, objetos con __slots__, objetos custom registrados,
          referencias circulares.
 
@@ -38,6 +38,16 @@ Seguridad:
   - NOTA: ref tracking usa id(obj); como el encoder mantiene refs a
     todos los objetos serializados, los IDs no se reutilizan durante
     una sola llamada a encode().
+
+Changelog v2.4.0:
+  - FIX: __getstate__/__setstate__ ahora tiene prioridad sobre dataclass
+         field walking — antes, dataclasses que definían __getstate__ eran
+         serializados recorriendo fields directamente, lo que causaba
+         MSCEncodeError si algún field contenía tipos no soportados (ej. deque).
+         La prioridad ahora es: __getstate__/__setstate__ > dataclass fields > __slots__ > __dict__
+  - ADD: Soporte nativo collections.deque (tag 0x1A) — preserva maxlen
+         y soporta referencias circulares
+  - Retrocompatible con payloads v2.3, v2.2, v2.1, v2.0 y v1.0
 
 Changelog v2.3.0:
   - ADD: HMAC-SHA256 autenticación criptográfica (hmac_key= en dumps/loads)
@@ -99,6 +109,7 @@ import hashlib
 import threading
 import inspect as _inspect_mod
 import dataclasses
+from collections import deque
 from datetime import datetime, date, time, timedelta
 from decimal import Decimal
 from enum import Enum
@@ -118,7 +129,7 @@ try:
 except ImportError:
     _torch = None
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 __all__ = [
     "dump", "load", "dumps", "loads",
     "dump_compressed", "load_compressed",
@@ -170,6 +181,7 @@ _UUID       = b'\x16'
 _PATH       = b'\x17'
 _TENSOR     = b'\x18'
 _TIMEDELTA2 = b'\x19'  # v2.2: timedelta sin ambiguedad
+_DEQUE      = b'\x1A'  # v2.4: collections.deque nativo
 
 _TAG_NAMES: Dict[int, str] = {
     0x00: 'None',    0x01: 'bool',      0x02: 'int',       0x03: 'float',
@@ -178,7 +190,7 @@ _TAG_NAMES: Dict[int, str] = {
     0x0C: 'complex', 0x0D: 'frozenset', 0x0E: 'datetime',  0x0F: 'date',
     0x10: 'time',    0x11: 'timedelta', 0x12: 'Decimal',   0x13: 'Enum',
     0x14: 'bytearray', 0x15: 'ref',    0x16: 'UUID',      0x17: 'Path',
-    0x18: 'tensor',  0x19: 'timedelta2',
+    0x18: 'tensor',  0x19: 'timedelta2', 0x1A: 'deque',
 }
 
 MAGIC   = b'MSCS'
@@ -213,31 +225,48 @@ _SAFE_NUMPY_DTYPES: Set[str] = {
 
 
 import re as _re
-_RE_DTYPE_SHORT = _re.compile(r'[fiubcUSV]\d+')
+# Solo dtypes numéricos seguros: f(loat), i(nt), u(int), b(ool), c(omplex)
+# NO incluir S(tring), U(nicode), V(oid) — estos permiten datos arbitrarios.
+_RE_DTYPE_SHORT = _re.compile(r'[fiubc]\d+')
 _RE_DTYPE_LONG  = _re.compile(r'(int|uint|float|complex|bool)\d*_?')
 
 
+# Dtypes no-numéricos: S(tring), U(nicode), V(oid) en notación corta.
+# Solo las versiones MAYÚSCULAS y 'v' minúscula son peligrosas.
+# 'u' minúscula es uint (u1=uint8, u2=uint16, etc.) — SEGURO.
+# 's' minúscula no existe como dtype válido en numpy, pero no es peligroso.
+_RE_UNSAFE_SHORTHAND = _re.compile(r'[<>=|!]?[SUV]\d+')
+_RE_UNSAFE_VOID_LOW  = _re.compile(r'[<>=|!]?v\d+')
+
+
 def _is_safe_dtype(dtype_str: str) -> bool:
-    """Valida que un dtype string sea seguro (no structured/object/void)."""
+    """Valida que un dtype string sea seguro (no structured/object/void/string)."""
     clean = dtype_str.strip()
     # Rechazar explícitamente tipos peligrosos (case-insensitive)
-    if clean.lower() in ('object', 'o', 'void', 'v'):
+    low = clean.lower()
+    if low in ('object', 'o', 'void', 'v', 's', 'u'):
         return False
-    clean = clean.lower()
-    # Tipos simples directos
-    if clean in _SAFE_NUMPY_DTYPES:
-        return True
+    # Rechazar string/unicode/void shorthand: S<n>, U<n>, V<n>
+    # (con o sin prefijo byteorder: <U8, >S16, |V32, etc.)
+    # Esto previene que un payload con dtype='U8' sea aceptado como
+    # 'u8' (uint64) tras lowercase pero interpretado como Unicode por numpy.
+    if _RE_UNSAFE_SHORTHAND.fullmatch(clean):
+        return False
+    # Rechazar void minúscula: v<n> (ej: v8)
+    if _RE_UNSAFE_VOID_LOW.fullmatch(clean):
+        return False
     # Con prefijo de byteorder: <f4, >i8, =f8, |b1, etc.
-    if len(clean) > 1 and clean[0] in '<>=|!':
-        clean = clean[1:]
-    # Numpy shorthand: f4, f8, i4, i8, u2, b1, c8, c16, etc.
-    if _RE_DTYPE_SHORT.fullmatch(clean):
-        # Rechazar V (void) — ya cubierto arriba
-        if clean[0] == 'V':
-            return False
+    stripped = low
+    if len(stripped) > 1 and stripped[0] in '<>=|!':
+        stripped = stripped[1:]
+    # Tipos simples directos (en minúsculas)
+    if low in _SAFE_NUMPY_DTYPES:
+        return True
+    # Numpy shorthand numérico: f4, f8, i4, i8, u2, b1, c8, c16
+    if _RE_DTYPE_SHORT.fullmatch(stripped):
         return True
     # Nombre completo con bitsize: float32, int64, etc.
-    if _RE_DTYPE_LONG.fullmatch(clean):
+    if _RE_DTYPE_LONG.fullmatch(stripped):
         return True
     return False
 
@@ -490,6 +519,17 @@ class _Encoder:
 
         # ── Colecciones (con ref tracking) ──
 
+        if isinstance(obj, deque):
+            if self._assign_ref(obj):
+                return
+            buf.write(_DEQUE)
+            maxlen = obj.maxlen
+            buf.write(struct.pack('<i', -1 if maxlen is None else maxlen))
+            self._write_length(len(obj))
+            for item in obj:
+                self.encode(item)
+            return
+
         if isinstance(obj, list):
             if self._assign_ref(obj):
                 return
@@ -589,7 +629,12 @@ class _Encoder:
         cls_path = _class_key(type(obj))
         self._encode_str(cls_path)
 
-        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        if '__getstate__' in type(obj).__dict__ or any(
+            '__getstate__' in c.__dict__ for c in type(obj).__mro__[:-1]
+            if c is not object
+        ):
+            state = obj.__getstate__()
+        elif dataclasses.is_dataclass(obj) and not isinstance(obj, type):
             state = {f.name: getattr(obj, f.name) for f in dataclasses.fields(obj)}
         elif hasattr(obj, '__slots__') and not hasattr(obj, '__dict__'):
             state = {}
@@ -597,11 +642,6 @@ class _Encoder:
                 for s in getattr(cls, '__slots__', ()):
                     if hasattr(obj, s) and s not in state:
                         state[s] = getattr(obj, s)
-        elif '__getstate__' in type(obj).__dict__ or any(
-            '__getstate__' in c.__dict__ for c in type(obj).__mro__[:-1]
-            if c is not object
-        ):
-            state = obj.__getstate__()
         elif hasattr(obj, '__dict__'):
             state = obj.__dict__
         else:
@@ -871,6 +911,30 @@ class _Decoder:
                 t = t.requires_grad_(True)
             return self._store_ref(t)
 
+        if tag == _DEQUE:
+            maxlen_raw = struct.unpack('<i', self._read(4))[0]
+            if maxlen_raw < -1:
+                raise MSCDecodeError(
+                    f"maxlen inválido para deque: {maxlen_raw} en {self._path_str()}"
+                )
+            maxlen = None if maxlen_raw == -1 else maxlen_raw
+            n = self._read_length()
+            # Prevenir CPU exhaustion: no decodear más items de los que
+            # el deque puede retener. Un payload con maxlen=1, count=10M
+            # forzaría decodear 10M items descartando 9,999,999.
+            if maxlen is not None and n > maxlen:
+                raise MSCDecodeError(
+                    f"Deque count ({n:,}) excede maxlen ({maxlen:,}) "
+                    f"en {self._path_str()} — posible payload adversarial"
+                )
+            result = deque(maxlen=maxlen)
+            self._store_ref(result)
+            for i in range(n):
+                self.path.append(f'[{i}]')
+                result.append(self.decode())
+                self.path.pop()
+            return result
+
         if tag == _OBJ:
             # Reserve ref slot BEFORE decoding children (matches encoder order)
             ref_id = len(self.refs)
@@ -891,17 +955,17 @@ class _Decoder:
                 return fallback
 
             obj = cls.__new__(cls)
-            if dataclasses.is_dataclass(cls):
+            if '__setstate__' in type(obj).__dict__ or any(
+                '__setstate__' in c.__dict__ for c in type(obj).__mro__[:-1]
+                if c is not object
+            ):
+                obj.__setstate__(state)
+            elif dataclasses.is_dataclass(cls):
                 for k, v in state.items():
                     setattr(obj, k, v)
             elif hasattr(obj, '__slots__') and not hasattr(obj, '__dict__'):
                 for k, v in state.items():
                     setattr(obj, k, v)
-            elif '__setstate__' in type(obj).__dict__ or any(
-                '__setstate__' in c.__dict__ for c in type(obj).__mro__[:-1]
-                if c is not object
-            ):
-                obj.__setstate__(state)
             elif hasattr(obj, '__dict__'):
                 obj.__dict__.update(state)
             else:
