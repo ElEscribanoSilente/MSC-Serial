@@ -2,6 +2,25 @@
 
 All notable changes to MSCS are documented here.
 
+## [Unreleased]
+
+### Security
+- **HMAC authentication bypass via v1 downgrade (Critical)** — `loads()` dispatched v1 payloads (`MSCS\x01`) before any HMAC verification, silently ignoring `hmac_key` and forcing `strict=False`. An attacker could forge an unauthenticated v1 payload and bypass HMAC authentication entirely, and trigger `__setstate__` of registered classes with attacker data. `loads()` now rejects a v1 payload when `hmac_key` is provided (fail-closed), closing the downgrade from a signed v2 payload to an unsigned v1 one. Anchors: `test_hmac_v1_downgrade_rejected`, `test_hmac_v1_object_downgrade_rejected`.
+- **Zip-bomb memory-exhaustion DoS in `load_compressed` (Medium)** — `zlib.decompress()` materialized the entire decompressed output before the `MAX_SIZE` check (`bufsize` is a hint, not a cap), so a small crafted payload could exhaust memory despite the guard. Decompression is now incremental and bounded to `MAX_SIZE + 1`, aborting as soon as the limit is crossed; peak memory stays near `MAX_SIZE` regardless of the bomb's true size. Anchor: `test_zip_bomb_bounded_memory`.
+- **ENUM tag type confusion (Medium)** — the decoder called `cls(value)` for any registered class referenced by an `ENUM` tag without checking it was an `Enum`, invoking arbitrary constructors with attacker-controlled arguments (beyond the documented `__setstate__` boundary). It now requires `issubclass(cls, Enum)` before instantiating. Anchor: `test_enum_tag_rejects_non_enum_class`.
+
+### Changed
+- v1 payloads now honor the caller's `strict` argument instead of forcing `strict=False`. Under the default `strict=True`, a v1 payload referencing an unregistered class now raises `MSCSecurityError` instead of returning a fallback dict.
+
+### Backward Compatibility
+- Wire format unchanged; all valid v2.4/v2.3/v2.2/v2.1/v2.0/v1.0 payloads still round-trip.
+- Two behavior changes affect **v1** payloads only: loading a v1 payload with `hmac_key` set is now rejected (it could never be authenticated), and unregistered objects in a v1 payload under the default `strict=True` now raise instead of returning a fallback dict. Load such legacy payloads without `hmac_key` (and with `strict=False` if the fallback dict is required).
+
+### Tests
+- Suite grows from 207 to 214 (7 new regression anchors and controls); zero regressions.
+
+---
+
 ## [2.4.0] — 2026-04-12
 
 ### Added
