@@ -820,6 +820,15 @@ class _Decoder:
             self.path.pop()
             if self.strict:
                 cls = _get_registered(class_path)
+                # El tag ENUM solo debe reconstruir Enums. Sin este chequeo,
+                # un payload puede apuntar a CUALQUIER clase registrada y
+                # forzar cls(value) con value del atacante — confusión de
+                # tipos que invoca el constructor fuera del modelo previsto.
+                if not (isinstance(cls, type) and issubclass(cls, Enum)):
+                    raise MSCSecurityError(
+                        f"Tag ENUM referencia clase no-Enum: {class_path!r}. "
+                        f"Posible confusión de tipos."
+                    )
                 return cls(value)
             else:
                 return {'__enum__': class_path, '__value__': value}
@@ -1044,10 +1053,21 @@ def loads(data: bytes, *, strict: bool = True,
     ver = data[4:5]
 
     if ver == b'\x01':
-        # Retrocompatibilidad con v1.0 (sin flags, sin trailing validation)
+        # Retrocompatibilidad con v1.0 (sin flags, sin integridad in-band).
+        # El formato v1 no puede transportar HMAC: si el llamante exige
+        # autenticación, un payload v1 nunca la satisface. Rechazarlo
+        # (fail-closed) cierra el downgrade de un v2 firmado a un v1 sin
+        # firma, que de otro modo evade por completo la verificación HMAC.
+        if hmac_key is not None:
+            raise MSCSecurityError(
+                "Se proporcionó hmac_key pero el payload es v1 (sin soporte HMAC). "
+                "Posible ataque de downgrade."
+            )
         buf = io.BytesIO(data)
         buf.seek(5)
-        dec = _Decoder(buf, strict=False)
+        # Respeta el strict del llamante: forzar strict=False sería otro
+        # downgrade silencioso de la política de seguridad solicitada.
+        dec = _Decoder(buf, strict=strict)
         return dec.decode()
 
     if ver != VERSION:
@@ -1140,12 +1160,27 @@ def load_compressed(file, **kwargs) -> Any:
         raise MSCDecodeError(
             f"Datos comprimidos exceden límite: {len(compressed):,} > {MAX_COMPRESSED:,}"
         )
-    raw = zlib.decompress(compressed, bufsize=orig_size)
-    if len(raw) > MAX_SIZE:
+    # Descompresión incremental con tope duro. zlib.decompress() materializa
+    # TODA la salida antes de que se pueda medir (bufsize es una pista, no un
+    # límite), así que una zip-bomb agota memoria pese al chequeo posterior.
+    # Descomprimir acotando la salida y abortar al cruzar MAX_SIZE mantiene el
+    # pico de memoria en ~MAX_SIZE en vez del tamaño real de la bomba.
+    decompressor = zlib.decompressobj()
+    out = bytearray()
+    buf = compressed
+    while buf:
+        out += decompressor.decompress(buf, MAX_SIZE + 1 - len(out))
+        if len(out) > MAX_SIZE:
+            raise MSCDecodeError(
+                f"Datos descomprimidos exceden límite: >{MAX_SIZE:,}"
+            )
+        buf = decompressor.unconsumed_tail
+    out += decompressor.flush()
+    if len(out) > MAX_SIZE:
         raise MSCDecodeError(
-            f"Datos descomprimidos exceden límite: {len(raw):,} > {MAX_SIZE:,}"
+            f"Datos descomprimidos exceden límite: >{MAX_SIZE:,}"
         )
-    return loads(raw, **kwargs)
+    return loads(bytes(out), **kwargs)
 
 
 def copy(obj: Any) -> Any:

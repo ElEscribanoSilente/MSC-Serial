@@ -28,7 +28,7 @@ from mscs._core import (
     _LIST, _TUPLE, _DICT, _SET, _NDARRAY, _OBJ, _COMPLEX,
     _FROZENSET, _DATETIME, _DATE, _TIME, _TIMEDELTA, _DECIMAL,
     _ENUM, _BYTEARRAY, _REF, _UUID, _PATH, _TENSOR, _TIMEDELTA2, _DEQUE,
-    _is_safe_dtype, _registry,
+    _is_safe_dtype, _registry, _class_key,
 )
 
 HEADER = MAGIC + VERSION + b'\x00'
@@ -501,6 +501,38 @@ class TestEnumSecurity:
         with pytest.raises(mscs.MSCSecurityError):
             mscs.loads(payload.getvalue(), strict=True)
 
+    def test_enum_tag_rejects_non_enum_class(self):
+        """Regression: an ENUM tag pointing at a registered NON-enum class
+        must be rejected, not invoke cls(value). Before the fix the decoder
+        called cls(attacker_value) on any registered class (type confusion)."""
+        init_seen = []
+
+        @mscs.register
+        class NotAnEnum:
+            def __init__(self, v):
+                init_seen.append(v)
+
+        payload = io.BytesIO()
+        payload.write(HEADER + _ENUM)
+        cp = _class_key(NotAnEnum).encode()
+        payload.write(_STR + struct.pack('<I', len(cp)) + cp)
+        payload.write(_INT + struct.pack('<H', 1) + b'\x2a')  # value = 42
+        with pytest.raises(mscs.MSCSecurityError, match="no-Enum"):
+            mscs.loads(payload.getvalue(), strict=True)
+        assert init_seen == [], "constructor must NOT run on ENUM type confusion"
+
+    def test_valid_enum_still_roundtrips(self):
+        """Control: a genuine registered Enum must still decode."""
+        import enum
+
+        @mscs.register
+        class Color(enum.Enum):
+            RED = 1
+            GREEN = 2
+
+        data = mscs.dumps(Color.GREEN)
+        assert mscs.loads(data, strict=True) is Color.GREEN
+
 
 # ═══════════════════════════════════════════════════════════════════
 # CRC INTEGRITY
@@ -549,6 +581,36 @@ class TestCompression:
                 io.BytesIO(struct.pack('<I', 600_000_000) + zlib.compress(b'x'))
             )
 
+    def test_zip_bomb_bounded_memory(self, monkeypatch):
+        """Regression: a payload decompressing far beyond MAX_SIZE must be
+        rejected WITHOUT materializing the whole bomb. MAX_SIZE is shrunk so
+        the test is cheap; the boundedness property is scale-invariant.
+        Before the fix, zlib.decompress() allocated the full output first,
+        so peak memory tracked the bomb size, not MAX_SIZE."""
+        import tracemalloc
+        from mscs import _core
+
+        monkeypatch.setattr(_core, 'MAX_SIZE', 1 << 20)     # 1 MB cap
+        compressed = zlib.compress(b'\x00' * (32 << 20), 9)  # 32 MB decompressed
+        blob = struct.pack('<I', 8) + compressed             # tiny orig_size hint
+
+        tracemalloc.start()
+        try:
+            with pytest.raises(mscs.MSCDecodeError):
+                mscs.load_compressed(io.BytesIO(blob))
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert peak < 4 * (1 << 20), f"peak {peak:,}B implies full decompression"
+
+    def test_compressed_roundtrip_larger(self):
+        """Control: a legitimate compressed payload still roundtrips."""
+        val = {"blob": b'\x00' * 100_000, "n": list(range(500))}
+        buf = io.BytesIO()
+        mscs.dump_compressed(val, buf)
+        buf.seek(0)
+        assert mscs.load_compressed(buf, strict=False) == val
+
 
 # ═══════════════════════════════════════════════════════════════════
 # DATETIME EDGE CASES
@@ -591,6 +653,22 @@ class TestBackwardCompat:
         v1_data = b'MSCS\x01' + _INT + struct.pack('<H', 1) + b'\x2a'
         result = mscs.loads(v1_data, strict=False)
         assert result == 42
+
+    def test_v1_respects_strict_true(self):
+        """Regression: v1 must honor the caller's strict flag instead of
+        forcing strict=False. An unregistered class under strict=True
+        (the default) must raise, not silently return a fallback dict."""
+        forged = io.BytesIO()
+        forged.write(b'MSCS\x01' + _OBJ)
+        cls_s = b'ghost.module.GhostClass'
+        forged.write(_STR + struct.pack('<I', len(cls_s)) + cls_s)
+        forged.write(_DICT + struct.pack('<I', 0))
+        payload = forged.getvalue()
+        with pytest.raises(mscs.MSCSecurityError):
+            mscs.loads(payload, strict=True)
+        # strict=False still yields the fallback dict (backward compat).
+        result = mscs.loads(payload, strict=False)
+        assert result == {'__class__': 'ghost.module.GhostClass', '__state__': {}}
 
     def test_timedelta_v22_uses_new_tag(self):
         td = timedelta(days=5, seconds=3661, microseconds=123456)
@@ -766,6 +844,28 @@ class TestHMAC:
         data = mscs.dumps(42)  # no hmac
         with pytest.raises(mscs.MSCSecurityError, match="downgrade"):
             mscs.loads(data, strict=False, hmac_key=self.KEY)
+
+    def test_hmac_v1_downgrade_rejected(self):
+        """Regression: a v1 payload cannot carry HMAC, so supplying a key
+        must be rejected as a downgrade — NOT decoded ignoring the key.
+
+        Before the fix, loads() dispatched v1 before any HMAC logic and
+        returned the attacker's forged payload while silently ignoring
+        hmac_key, fully bypassing authentication."""
+        forged_v1 = b'MSCS\x01' + _INT + struct.pack('<H', 1) + b'\x2a'
+        with pytest.raises(mscs.MSCSecurityError, match="downgrade"):
+            mscs.loads(forged_v1, hmac_key=self.KEY)
+
+    def test_hmac_v1_object_downgrade_rejected(self):
+        """A v1 OBJ payload for a registered class must not run __setstate__
+        when a key is supplied: the missing HMAC is rejected first."""
+        forged = io.BytesIO()
+        forged.write(b'MSCS\x01' + _OBJ)
+        cls_s = b'attacker.module.Anything'
+        forged.write(_STR + struct.pack('<I', len(cls_s)) + cls_s)
+        forged.write(_DICT + struct.pack('<I', 0))
+        with pytest.raises(mscs.MSCSecurityError, match="downgrade"):
+            mscs.loads(forged.getvalue(), hmac_key=self.KEY)
 
     def test_hmac_and_crc_mutually_exclusive(self):
         with pytest.raises(mscs.MSCEncodeError):
