@@ -1,6 +1,6 @@
 # MSCS — Safe Serialization for Python
 
-**v2.4.0** | [Changelog](CHANGELOG.md) | [PyPI](https://pypi.org/project/mscs/)
+**v2.4.1** | [Changelog](CHANGELOG.md) | [PyPI](https://pypi.org/project/mscs/)
 
 > **Status: Beta** — API is stable but the format may evolve. Not yet battle-tested in large-scale production.
 

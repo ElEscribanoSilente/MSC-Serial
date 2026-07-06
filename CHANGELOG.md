@@ -2,7 +2,7 @@
 
 All notable changes to MSCS are documented here.
 
-## [Unreleased]
+## [2.4.1] — 2026-07-06
 
 ### Security
 - **HMAC authentication bypass via v1 downgrade (Critical)** — `loads()` dispatched v1 payloads (`MSCS\x01`) before any HMAC verification, silently ignoring `hmac_key` and forcing `strict=False`. An attacker could forge an unauthenticated v1 payload and bypass HMAC authentication entirely, and trigger `__setstate__` of registered classes with attacker data. `loads()` now rejects a v1 payload when `hmac_key` is provided (fail-closed), closing the downgrade from a signed v2 payload to an unsigned v1 one. Anchors: `test_hmac_v1_downgrade_rejected`, `test_hmac_v1_object_downgrade_rejected`.
