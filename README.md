@@ -173,7 +173,7 @@ mscs.loads(unsigned_data, hmac_key=key)  # MSCSecurityError: anti-downgrade prot
 | `Enum` | Must be registered |
 | `numpy.ndarray` | dtype whitelist enforced |
 | `torch.Tensor` | Auto CPU transfer, preserves requires_grad |
-| `dataclass`, `__slots__`, `__dict__` objects | Must be registered |
+| `dataclass` (incl. `frozen`), `__slots__`, `__dict__` objects | Must be registered |
 
 ## Performance
 
@@ -201,10 +201,10 @@ mscs provides a **defense-in-depth** approach, but it is **not a sandbox**. Unde
 2. **Explicit registry**: Custom classes must be registered before deserialization; unregistered classes raise `MSCSecurityError`
 3. **NumPy dtype whitelist**: Blocks `object`, `void`, and structured dtypes that could execute code
 4. **Configurable limits**: `MAX_DEPTH=256`, `MAX_SIZE=512MB`, `MAX_COLLECTION=10M`, `MAX_INT_BYTES=8192`
-5. **Anti zip-bomb**: `load_compressed` validates both compressed and decompressed sizes with bounded reads
+5. **Anti zip-bomb**: `load_compressed` caps the compressed input and decompresses **incrementally** against a hard `MAX_SIZE` limit, aborting as soon as it is crossed — a bomb cannot exhaust memory before the size check
 6. **Path null byte rejection**: Paths containing null bytes are rejected
 7. **CRC32 corruption detection**: Optional checksum to detect accidental data corruption (not cryptographic — an attacker can forge CRC32)
-8. **HMAC-SHA256 authentication**: Optional cryptographic signature to detect intentional tampering. Anti-downgrade protection prevents stripping the HMAC flag.
+8. **HMAC-SHA256 authentication**: Optional cryptographic signature to detect intentional tampering. Anti-downgrade protection rejects any payload lacking a valid HMAC when a key is supplied — including the legacy **v1** format — so an attacker cannot strip or version-downgrade the signature.
 9. **Trailing bytes rejection**: Payloads with unexpected bytes after the serialized object are rejected
 10. **Integer size limit**: Ints larger than `MAX_INT_BYTES` (8192 bytes, ~19,700 digits) are rejected to prevent CPU exhaustion attacks
 

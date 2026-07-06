@@ -970,8 +970,11 @@ class _Decoder:
             ):
                 obj.__setstate__(state)
             elif dataclasses.is_dataclass(cls):
+                # object.__setattr__ (no setattr) para que las dataclasses
+                # frozen — cuyo __setattr__ lanza FrozenInstanceError — hagan
+                # round-trip. Es lo que usa el __init__ generado de la dataclass.
                 for k, v in state.items():
-                    setattr(obj, k, v)
+                    object.__setattr__(obj, k, v)
             elif hasattr(obj, '__slots__') and not hasattr(obj, '__dict__'):
                 for k, v in state.items():
                     setattr(obj, k, v)
