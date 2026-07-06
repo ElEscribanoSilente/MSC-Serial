@@ -291,6 +291,21 @@ class TestCustomClasses:
         assert result.x == 1.5
         assert result.y == 2.5
 
+    def test_frozen_dataclass_roundtrip(self):
+        """Regression: frozen dataclasses encoded fine but the decoder used
+        setattr, which frozen instances forbid, so decode raised
+        MSCDecodeError. The dataclass branch now uses object.__setattr__."""
+        @mscs.register
+        @dataclasses.dataclass(frozen=True)
+        class FrozenPoint:
+            x: int = 0
+            y: int = 0
+
+        p = FrozenPoint(3, 4)
+        result = mscs.loads(mscs.dumps(p))
+        assert isinstance(result, FrozenPoint)
+        assert result == FrozenPoint(3, 4)
+
     def test_slots_roundtrip(self):
         @mscs.register
         class SlottedObj:

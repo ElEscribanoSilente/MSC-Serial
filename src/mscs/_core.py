@@ -39,6 +39,21 @@ Seguridad:
     todos los objetos serializados, los IDs no se reutilizan durante
     una sola llamada a encode().
 
+Changelog v2.4.1:
+  - SECURITY: loads() rechaza payloads v1 cuando se pasa hmac_key (fail-closed).
+              Antes despachaba v1 antes de la verificación HMAC, ignorando la
+              clave por completo y evadiendo la autenticación (downgrade). v1
+              ahora respeta el strict del llamante en vez de forzar strict=False.
+  - SECURITY: load_compressed descomprime incrementalmente con tope MAX_SIZE.
+              Antes materializaba toda la salida antes de validar el tamaño,
+              permitiendo una zip-bomb que agotaba memoria pese al límite.
+  - SECURITY: el tag ENUM verifica issubclass(cls, Enum) antes de instanciar.
+              Antes hacía cls(value) para cualquier clase registrada (confusión
+              de tipos que invocaba constructores arbitrarios).
+  - FIX: round-trip de dataclass frozen — el decoder usa object.__setattr__ en
+         vez de setattr (que FrozenInstanceError prohíbe en instancias frozen).
+  - Retrocompatible con payloads v2.4, v2.3, v2.2, v2.1, v2.0 y v1.0
+
 Changelog v2.4.0:
   - FIX: __getstate__/__setstate__ ahora tiene prioridad sobre dataclass
          field walking — antes, dataclasses que definían __getstate__ eran
@@ -129,7 +144,7 @@ try:
 except ImportError:
     _torch = None
 
-__version__ = "2.4.0"
+__version__ = "2.4.1"
 __all__ = [
     "dump", "load", "dumps", "loads",
     "dump_compressed", "load_compressed",
@@ -970,8 +985,11 @@ class _Decoder:
             ):
                 obj.__setstate__(state)
             elif dataclasses.is_dataclass(cls):
+                # object.__setattr__ (no setattr) para que las dataclasses
+                # frozen — cuyo __setattr__ lanza FrozenInstanceError — hagan
+                # round-trip. Es lo que usa el __init__ generado de la dataclass.
                 for k, v in state.items():
-                    setattr(obj, k, v)
+                    object.__setattr__(obj, k, v)
             elif hasattr(obj, '__slots__') and not hasattr(obj, '__dict__'):
                 for k, v in state.items():
                     setattr(obj, k, v)
