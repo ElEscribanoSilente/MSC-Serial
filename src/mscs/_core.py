@@ -1,5 +1,5 @@
 """
-MSC Serial v2.4
+MSC Serial v2.5
 ===============
 Reemplazo personal y seguro de pickle.
 
@@ -38,6 +38,71 @@ Seguridad:
   - NOTA: ref tracking usa id(obj); como el encoder mantiene refs a
     todos los objetos serializados, los IDs no se reutilizan durante
     una sola llamada a encode().
+
+Changelog v2.5.0:
+  - SECURITY: MAX_SIZE ahora acota el blob TOTAL, no solo cada campo. loads()
+              no comprobaba el tamaño total: los topes por campo (MAX_STRING,
+              MAX_COLLECTION, MAX_SIZE por array) se cumplían mientras su SUMA
+              quedaba sin acotar, y load() materializaba el archivo entero con
+              file.read() antes de cualquier chequeo. loads() rechaza ahora
+              len(data)>max_size antes del dispatch de versión (v1 y v2); load()
+              lee como máximo max_size+1 bytes; load_compressed() acota TANTO
+              la salida descomprimida como la lectura comprimida a max_size. El
+              tope es sobre el blob total (datos + framing): copy() acota su
+              round-trip confiable a la longitud exacta del blob. El pico de
+              memoria sigue siendo un múltiplo de max_size (overhead de objetos
+              Python ~6x): ajústalo bajo para entrada no confiable.
+  - SECURITY: load_compressed valida la integridad del contenedor con la
+              misma estrictez que loads() aplica al payload. Antes no verificaba
+              el fin del stream zlib (decompressor.eof), no rechazaba bytes tras
+              el stream (unused_data), no comparaba el tamaño real con orig_size,
+              un header truncado filtraba struct.error y un stream corrupto
+              filtraba zlib.error crudo. Así un stream truncado (sin parte del
+              ADLER32), un orig_size forjado, basura final o dos contenedores
+              concatenados pasaban como válidos. Ahora cada caso falla cerrado
+              con MSCDecodeError (zlib.error envuelto). La lectura comprimida se
+              acota por compressBound(max_size) — los datos incompresibles
+              crecen al comprimirse, así que acotar al tamaño crudo rechazaba
+              round-trips legítimos con max_size ajustado.
+  - SECURITY: límites configurables de verdad, por llamada. dumps/dump aceptan
+              max_depth; loads/load/load_compressed aceptan max_size y max_depth
+              (default = constante del módulo). Reasignar mscs.MAX_DEPTH /
+              mscs.MAX_SIZE no tenía efecto (nombres re-exportados, no los
+              globals que lee _core); los parámetros per-call son el knob
+              soportado.
+  - FIX: pérdida silenciosa de atributos __slots__. Tres formas fallaban sin
+         error: __slots__ declarado como string (iterado carácter a carácter
+         → estado vacío), clases híbridas (base con slots + subclase con
+         __dict__ → los slots heredados se perdían y el decoder los escribía
+         en __dict__, donde el descriptor los sombrea), y slots privados
+         (__nombre buscado sin name-mangling). _collect_slot_names() recorre
+         el MRO con el __slots__ propio de cada clase (str/iterable/dict),
+         aplica el mangling de CPython y excluye __dict__/__weakref__; el
+         encoder fusiona slots + __dict__ en híbridas y el decoder enruta
+         cada clave a su almacén: slots vía descriptor (setattr) y el resto
+         directo al __dict__ de instancia — setattr indiscriminado dejaría
+         que una clave espuria '__dict__' reemplazara el dict del objeto.
+  - FIX: corrupción silenciosa de referencias circulares a través de tuplas
+         y de objetos registrados. El decoder reservaba None como placeholder
+         antes de decodificar hijos y _REF lo devolvía tal cual: los ciclos
+         vía tupla y las auto/mutuas referencias de objetos decodificaban con
+         None incrustado, sin error. Ahora los objetos se crean y publican
+         ANTES de decodificar su estado (identidad primero, como pickle) y
+         las refs hacia tuplas en construcción se resuelven con fix-ups
+         diferidos que parchean el sitio de inserción en cascada.
+  - SECURITY: payloads forjados con _REF hacia slots en construcción en
+              posiciones no parcheables (clave de dict, set/frozenset, tupla
+              raíz auto-referente, Enum value, estado bajo __setstate__
+              custom) fallan cerrado con MSCDecodeError en vez de corromper.
+              loads() verifica en ambas ramas de versión (v1 y v2) que
+              ningún placeholder sobreviva al decode.
+  - SECURITY: el código de usuario (__setattr__ sobrescrito, properties/
+              descriptors, __setstate__) jamás observa el sentinela interno:
+              un valor pendiente nunca se asigna — el fix-up realiza la
+              primera y única asignación con el valor real.
+  - Retrocompatible: formato intacto (encoder sin cambios); payloads v2.x y
+    v1.0 válidos siguen cargando — los grafos cíclicos que antes cargaban
+    corruptos ahora cargan correctos desde los mismos bytes.
 
 Changelog v2.4.1:
   - SECURITY: loads() rechaza payloads v1 cuando se pasa hmac_key (fail-closed).
@@ -144,7 +209,7 @@ try:
 except ImportError:
     _torch = None
 
-__version__ = "2.4.1"
+__version__ = "2.5.0"
 __all__ = [
     "dump", "load", "dumps", "loads",
     "dump_compressed", "load_compressed",
@@ -347,6 +412,32 @@ def register_alias(alias: str, cls: Type) -> None:
         _registry[alias] = cls
 
 
+def _collect_slot_names(cls: Type) -> tuple:
+    """Nombres reales (post name-mangling) de todos los __slots__ del MRO,
+    excluyendo __dict__ y __weakref__. Acepta __slots__ declarado como str
+    (un solo slot), como iterable o como dict (se usan las claves)."""
+    names: List[str] = []
+    seen: Set[str] = set()
+    for klass in cls.__mro__:
+        slots = klass.__dict__.get('__slots__', ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for s in slots:
+            if s in ('__dict__', '__weakref__'):
+                continue
+            if s.startswith('__') and not s.endswith('__'):
+                # Regla de CPython: _NombreClase__slot, con los underscores
+                # iniciales del nombre de la clase eliminados; si el nombre
+                # queda vacío (clase '_'), no se aplica mangling.
+                stripped = klass.__name__.lstrip('_')
+                if stripped:
+                    s = f'_{stripped}{s}'
+            if s not in seen:
+                seen.add(s)
+                names.append(s)
+    return tuple(names)
+
+
 def _is_registered(class_path: str) -> bool:
     return class_path in _registry
 
@@ -363,21 +454,27 @@ def _get_registered(class_path: str) -> Type:
 # ──────────────────────── ENCODER ─────────────────────────────────
 
 class _Encoder:
-    __slots__ = ('buf', 'depth', 'refs', 'ref_counter', 'use_refs', '_pinned')
+    __slots__ = ('buf', 'depth', 'refs', 'ref_counter', 'use_refs', '_pinned',
+                 'max_depth')
 
-    def __init__(self, buf: io.BytesIO, *, use_refs: bool = True):
+    def __init__(self, buf: io.BytesIO, *, use_refs: bool = True,
+                 max_depth: Optional[int] = None):
         self.buf = buf
         self.depth = 0
         self.refs: Dict[int, int] = {}   # id(obj) -> ref_id
         self.ref_counter = 0
         self.use_refs = use_refs
         self._pinned: list = []  # prevent GC of temporary objects (id reuse)
+        # Capturado por instancia: el default es el módulo, pero un llamante
+        # puede acotarlo por llamada (reasignar mscs.MAX_DEPTH no tendría
+        # efecto — es un nombre re-exportado, no el global que lee _core).
+        self.max_depth = MAX_DEPTH if max_depth is None else max_depth
 
     def encode(self, obj: Any):
         self.depth += 1
-        if self.depth > MAX_DEPTH:
+        if self.depth > self.max_depth:
             raise MSCEncodeError(
-                f"Profundidad máxima excedida ({MAX_DEPTH}). "
+                f"Profundidad máxima excedida ({self.max_depth}). "
                 f"¿Referencia circular no detectada?"
             )
         try:
@@ -651,16 +748,22 @@ class _Encoder:
             state = obj.__getstate__()
         elif dataclasses.is_dataclass(obj) and not isinstance(obj, type):
             state = {f.name: getattr(obj, f.name) for f in dataclasses.fields(obj)}
-        elif hasattr(obj, '__slots__') and not hasattr(obj, '__dict__'):
-            state = {}
-            for cls in type(obj).__mro__:
-                for s in getattr(cls, '__slots__', ()):
-                    if hasattr(obj, s) and s not in state:
-                        state[s] = getattr(obj, s)
-        elif hasattr(obj, '__dict__'):
-            state = obj.__dict__
         else:
-            raise MSCEncodeError(f"No se puede serializar: {type(obj)!r}")
+            slot_names = _collect_slot_names(type(obj))
+            if slot_names:
+                # Clases con __slots__ (puras o híbridas con __dict__):
+                # nombres reales del MRO completo, post name-mangling. Los
+                # slots pisan claves homónimas espurias del __dict__ (in-
+                # accesibles: el descriptor gana) — se serializa el valor
+                # efectivo. Slots sin asignar se omiten (quedan unset).
+                state = dict(obj.__dict__) if hasattr(obj, '__dict__') else {}
+                for s in slot_names:
+                    if hasattr(obj, s):
+                        state[s] = getattr(obj, s)
+            elif hasattr(obj, '__dict__'):
+                state = obj.__dict__
+            else:
+                raise MSCEncodeError(f"No se puede serializar: {type(obj)!r}")
 
         # Pin temporary state dicts to prevent id() reuse. CPython may
         # reuse the id of a temporary dict after it goes out of scope,
@@ -680,21 +783,43 @@ class _Encoder:
 
 # ──────────────────────── DECODER ─────────────────────────────────
 
-class _Decoder:
-    __slots__ = ('buf', 'depth', 'refs', 'strict', 'path')
+# Marcador para un slot de ref reservado cuyo contenedor aún se está
+# construyendo (la ventana entre reservar el slot y materializar una
+# tupla/frozenset, o crear la instancia de un objeto). Solo vive dentro
+# de _Decoder.refs; nadie más lo ve.
+_PENDING_SLOT = object()
 
-    def __init__(self, buf: io.BytesIO, *, strict: bool = True):
+
+class _Pending:
+    """Sentinela que _REF devuelve al apuntar a un slot aún en ventana
+    (ciclo hacia una tupla ancestro en construcción). Nunca escapa del
+    decoder: o se sustituye vía fix-ups o el decode aborta."""
+    __slots__ = ('ref_id',)
+
+    def __init__(self, ref_id: int):
+        self.ref_id = ref_id
+
+
+class _Decoder:
+    __slots__ = ('buf', 'depth', 'refs', 'strict', 'path', '_fixups',
+                 '_open_windows', 'max_depth')
+
+    def __init__(self, buf: io.BytesIO, *, strict: bool = True,
+                 max_depth: Optional[int] = None):
         self.buf = buf
         self.depth = 0
         self.refs: Dict[int, Any] = {}
         self.strict = strict
         self.path: List[str] = []  # breadcrumbs para errores
+        self._fixups: Dict[int, List] = {}  # ref_id pendiente -> [callable(valor)]
+        self._open_windows = 0              # slots _PENDING_SLOT vivos en refs
+        self.max_depth = MAX_DEPTH if max_depth is None else max_depth
 
     def decode(self) -> Any:
         self.depth += 1
-        if self.depth > MAX_DEPTH:
+        if self.depth > self.max_depth:
             raise MSCDecodeError(
-                f"Profundidad máxima excedida ({MAX_DEPTH}) en {self._path_str()}"
+                f"Profundidad máxima excedida ({self.max_depth}) en {self._path_str()}"
             )
         try:
             return self._decode()
@@ -731,6 +856,59 @@ class _Decoder:
         self.refs[len(self.refs)] = obj
         return obj
 
+    def _reserve_ref(self) -> int:
+        """Reserva el próximo slot de ref con el marcador de ventana (el
+        orden de slots debe coincidir con el orden de asignación del
+        encoder)."""
+        ref_id = len(self.refs)
+        self.refs[ref_id] = _PENDING_SLOT
+        self._open_windows += 1
+        return ref_id
+
+    def _resolve_ref(self, ref_id: int, obj: Any) -> None:
+        """Publica el valor final de un slot pendiente y aplica los fix-ups
+        que esperaban por él (huecos dejados por _REF durante la ventana)."""
+        self.refs[ref_id] = obj
+        self._open_windows -= 1
+        if self._fixups:
+            for fixup in self._fixups.pop(ref_id, ()):
+                fixup(obj)
+
+    def _defer(self, pending: _Pending, fixup) -> None:
+        """Programa fixup(valor) para cuando pending.ref_id se resuelva."""
+        self._fixups.setdefault(pending.ref_id, []).append(fixup)
+
+    def _contains_pending(self, node: Any, _seen: Optional[Set[int]] = None) -> bool:
+        """True si node alcanza algún _Pending vía contenedores planos
+        (dict/list/tuple/deque). Solo se llama con ventanas abiertas
+        (ciclos a través de tuplas), nunca en el camino común."""
+        if type(node) is _Pending:
+            return True
+        if isinstance(node, (list, tuple, deque)):
+            items = node
+        elif isinstance(node, dict):
+            items = node.values()
+        else:
+            return False
+        if _seen is None:
+            _seen = set()
+        if id(node) in _seen:
+            return False
+        _seen.add(id(node))
+        return any(self._contains_pending(x, _seen) for x in items)
+
+    def assert_fully_resolved(self, result: Any) -> Any:
+        """Rechaza payloads que dejaron refs sin resolver. Un payload
+        legítimo siempre termina con todos los slots materializados; uno
+        forjado puede dejar placeholders colgando (p. ej. una tupla que
+        se referencia a sí misma sin ancestro que la resuelva)."""
+        if type(result) is _Pending or self._open_windows or self._fixups:
+            raise MSCDecodeError(
+                "Payload con referencias sin resolver hacia contenedores "
+                "nunca completados — corrupto o forjado."
+            )
+        return result
+
     def _decode(self) -> Any:
         tag = self._read(1)
 
@@ -762,7 +940,14 @@ class _Decoder:
                 raise MSCDecodeError(
                     f"Referencia inválida: {ref_id} en {self._path_str()}"
                 )
-            return self.refs[ref_id]
+            val = self.refs[ref_id]
+            if val is _PENDING_SLOT:
+                # Ref hacia un ancestro aún en construcción: se entrega un
+                # sentinela y cada sitio de inserción registra un fix-up
+                # (contenedores mutables) o falla cerrado (posiciones
+                # hasheadas, donde parchear es imposible).
+                return _Pending(ref_id)
+            return val
 
         if tag == _STR:
             n = self._read_length(MAX_STRING)
@@ -833,6 +1018,14 @@ class _Decoder:
             self.path.append(f'Enum({class_path})')
             value = self.decode()
             self.path.pop()
+            if type(value) is _Pending:
+                # Sin este chequeo, en strict=False el sentinela escaparía
+                # dentro del dict {'__enum__', '__value__'} sin fix-up
+                # registrado (fuga silenciosa de un placeholder al usuario).
+                raise MSCDecodeError(
+                    f"Enum value referencia un contenedor en construcción "
+                    f"en {self._path_str()} — payload corrupto o forjado"
+                )
             if self.strict:
                 cls = _get_registered(class_path)
                 # El tag ENUM solo debe reconstruir Enums. Sin este chequeo,
@@ -854,38 +1047,87 @@ class _Decoder:
             self._store_ref(result)
             for i in range(n):
                 self.path.append(f'[{i}]')
-                result.append(self.decode())
+                item = self.decode()
                 self.path.pop()
+                result.append(item)
+                if type(item) is _Pending:
+                    # Hueco hacia una tupla ancestro en construcción:
+                    # se parchea cuando esta se materialice.
+                    self._defer(item, lambda v, c=result, k=i: c.__setitem__(k, v))
             return result
 
         if tag == _TUPLE:
             n = self._read_length()
-            # Reserve ref slot BEFORE decoding children (matches encoder order)
-            ref_id = len(self.refs)
-            self.refs[ref_id] = None  # placeholder
+            # Reserva el slot ANTES de decodificar hijos (mismo orden que
+            # el encoder). La tupla no existe hasta tener todos sus items:
+            # los _REF hacia ella durante esta ventana reciben un sentinela
+            # y se resuelven vía fix-ups al materializarla.
+            ref_id = self._reserve_ref()
             items = []
+            has_pending = False
             for i in range(n):
                 self.path.append(f'({i})')
-                items.append(self.decode())
+                item = self.decode()
                 self.path.pop()
-            t = tuple(items)
-            self.refs[ref_id] = t  # fill placeholder
-            return t
+                items.append(item)
+                if type(item) is _Pending:
+                    has_pending = True
+            if not has_pending:
+                t = tuple(items)
+                self._resolve_ref(ref_id, t)
+                return t
+            # Algún item referencia un ancestro aún en construcción: esta
+            # tupla queda pendiente y se materializa (en cascada) cuando
+            # el último ancestro pendiente se resuelva.
+            pending_slots = [i for i, item in enumerate(items)
+                             if type(item) is _Pending]
+            remaining = [len(pending_slots)]
+
+            def _fill_slot(idx):
+                def _fixup(value):
+                    items[idx] = value
+                    remaining[0] -= 1
+                    if remaining[0] == 0:
+                        self._resolve_ref(ref_id, tuple(items))
+                return _fixup
+
+            for idx in pending_slots:
+                self._defer(items[idx], _fill_slot(idx))
+            return _Pending(ref_id)
 
         if tag == _FROZENSET:
             n = self._read_length()
-            # Reserve ref slot BEFORE decoding children (matches encoder order)
-            ref_id = len(self.refs)
-            self.refs[ref_id] = None  # placeholder
-            items = frozenset(self.decode() for _ in range(n))
-            self.refs[ref_id] = items  # fill placeholder
-            return items
+            # Reserva el slot ANTES de decodificar hijos (mismo orden que
+            # el encoder).
+            ref_id = self._reserve_ref()
+            items = []
+            for _ in range(n):
+                item = self.decode()
+                if type(item) is _Pending:
+                    # Un frozenset legítimo no puede referenciar un contenedor
+                    # en construcción: exigiría hashear un ciclo (inconstruible).
+                    raise MSCDecodeError(
+                        f"frozenset referencia un contenedor en construcción en "
+                        f"{self._path_str()} — payload corrupto o forjado"
+                    )
+                items.append(item)
+            result = frozenset(items)
+            self._resolve_ref(ref_id, result)
+            return result
 
         if tag == _SET:
             n = self._read_length()
             result = set()
             self._store_ref(result)
-            result.update(self.decode() for _ in range(n))
+            for _ in range(n):
+                item = self.decode()
+                if type(item) is _Pending:
+                    raise MSCDecodeError(
+                        f"set contiene una referencia a un contenedor en "
+                        f"construcción en {self._path_str()} — payload "
+                        f"corrupto o forjado"
+                    )
+                result.add(item)
             return result
 
         if tag == _DICT:
@@ -894,10 +1136,18 @@ class _Decoder:
             self._store_ref(result)
             for _ in range(n):
                 k = self.decode()
+                if type(k) is _Pending:
+                    raise MSCDecodeError(
+                        f"clave de dict referencia un contenedor en "
+                        f"construcción en {self._path_str()} — payload "
+                        f"corrupto o forjado"
+                    )
                 self.path.append(f'.{k!r}' if isinstance(k, str) else f'[{k!r}]')
                 v = self.decode()
                 self.path.pop()
                 result[k] = v
+                if type(v) is _Pending:
+                    self._defer(v, lambda val, c=result, key=k: c.__setitem__(key, val))
             return result
 
         if tag == _NDARRAY:
@@ -955,50 +1205,115 @@ class _Decoder:
             self._store_ref(result)
             for i in range(n):
                 self.path.append(f'[{i}]')
-                result.append(self.decode())
+                item = self.decode()
                 self.path.pop()
+                result.append(item)
+                if type(item) is _Pending:
+                    # Índices estables: n <= maxlen ya está validado, así
+                    # que ningún append desplaza items ya insertados.
+                    self._defer(item, lambda v, c=result, k=i: c.__setitem__(k, v))
             return result
 
         if tag == _OBJ:
-            # Reserve ref slot BEFORE decoding children (matches encoder order)
-            ref_id = len(self.refs)
-            self.refs[ref_id] = None  # placeholder
+            # Reserva el slot ANTES de decodificar hijos (mismo orden que
+            # el encoder).
+            ref_id = self._reserve_ref()
 
             class_path = self._decode_str()
+
+            if self.strict:
+                cls = _get_registered(class_path)
+            else:
+                cls = _registry.get(class_path)
+
+            if cls is None:
+                # strict=False + clase no registrada: dict fallback. Se
+                # publica ANTES de decodificar el estado para que los
+                # ciclos hacia el objeto resuelvan contra el fallback.
+                fallback = {'__class__': class_path, '__state__': None}
+                self._resolve_ref(ref_id, fallback)
+                self.path.append(class_path.rsplit('.', 1)[-1])
+                state = self.decode()
+                self.path.pop()
+                if type(state) is _Pending:
+                    self._defer(state, lambda v, c=fallback: c.__setitem__('__state__', v))
+                else:
+                    fallback['__state__'] = state
+                return fallback
+
+            # La instancia se crea y publica ANTES de decodificar el
+            # estado: los _REF del estado hacia el objeto reciben la
+            # instancia real (identidad primero, estado después — misma
+            # semántica que pickle en grafos cíclicos).
+            obj = cls.__new__(cls)
+            self._resolve_ref(ref_id, obj)
             self.path.append(class_path.rsplit('.', 1)[-1])
             state = self.decode()
             self.path.pop()
 
-            if self.strict:
-                cls = _get_registered(class_path)
-            elif _is_registered(class_path):
-                cls = _registry[class_path]
-            else:
-                fallback = {'__class__': class_path, '__state__': state}
-                self.refs[ref_id] = fallback
-                return fallback
-
-            obj = cls.__new__(cls)
+            if type(state) is _Pending:
+                raise MSCDecodeError(
+                    f"El estado de {class_path} referencia un contenedor "
+                    f"en construcción en {self._path_str()} — irresoluble"
+                )
             if '__setstate__' in type(obj).__dict__ or any(
                 '__setstate__' in c.__dict__ for c in type(obj).__mro__[:-1]
                 if c is not object
             ):
+                if self._open_windows and self._contains_pending(state):
+                    raise MSCDecodeError(
+                        f"El estado de {class_path} contiene referencias a "
+                        f"una tupla en construcción y la clase define "
+                        f"__setstate__: los huecos no pueden parchearse a "
+                        f"través de él. Rompe el ciclo por un contenedor "
+                        f"mutable o elimina __setstate__."
+                    )
                 obj.__setstate__(state)
             elif dataclasses.is_dataclass(cls):
                 # object.__setattr__ (no setattr) para que las dataclasses
                 # frozen — cuyo __setattr__ lanza FrozenInstanceError — hagan
                 # round-trip. Es lo que usa el __init__ generado de la dataclass.
+                # Un valor pendiente NUNCA se asigna: la primera (y única)
+                # asignación la hace el fix-up con el valor real, para que
+                # descriptors/__setattr__ de usuario jamás vean el sentinela.
                 for k, v in state.items():
-                    object.__setattr__(obj, k, v)
-            elif hasattr(obj, '__slots__') and not hasattr(obj, '__dict__'):
-                for k, v in state.items():
-                    setattr(obj, k, v)
-            elif hasattr(obj, '__dict__'):
-                obj.__dict__.update(state)
+                    if type(v) is _Pending:
+                        self._defer(v, lambda val, o=obj, key=k: object.__setattr__(o, key, val))
+                    else:
+                        object.__setattr__(obj, k, v)
             else:
-                for k, v in state.items():
-                    setattr(obj, k, v)
-            self.refs[ref_id] = obj
+                slot_names = _collect_slot_names(cls)
+                has_dict = hasattr(obj, '__dict__')
+                if not slot_names and has_dict:
+                    # Camino común: clase solo-__dict__.
+                    if self._open_windows:
+                        for k, v in state.items():
+                            if type(v) is _Pending:
+                                self._defer(v, lambda val, c=obj.__dict__, key=k: c.__setitem__(key, val))
+                            else:
+                                obj.__dict__[k] = v
+                    else:
+                        obj.__dict__.update(state)
+                else:
+                    # Clases con __slots__ (puras o híbridas) o sin __dict__:
+                    # cada clave va a su almacén. Los slots se asignan vía su
+                    # descriptor (setattr; escribirlos en obj.__dict__ los
+                    # dejaría sombreados e inaccesibles) y el resto va
+                    # directo al __dict__ de instancia — nunca por setattr,
+                    # que con una clave espuria '__dict__' REEMPLAZARÍA el
+                    # dict del objeto entero. En slots puros, una clave
+                    # no-slot cae a setattr y falla cerrado (AttributeError).
+                    slot_set = set(slot_names)
+                    for k, v in state.items():
+                        if k in slot_set or not has_dict:
+                            if type(v) is _Pending:
+                                self._defer(v, lambda val, o=obj, key=k: setattr(o, key, val))
+                            else:
+                                setattr(obj, k, v)
+                        elif type(v) is _Pending:
+                            self._defer(v, lambda val, c=obj.__dict__, key=k: c.__setitem__(key, val))
+                        else:
+                            obj.__dict__[k] = v
             return obj
 
         raise MSCDecodeError(
@@ -1019,7 +1334,8 @@ class _Decoder:
 # ──────────────────────── PUBLIC API ──────────────────────────────
 
 def dumps(obj: Any, *, with_crc: bool = False,
-          hmac_key: Optional[bytes] = None) -> bytes:
+          hmac_key: Optional[bytes] = None,
+          max_depth: Optional[int] = None) -> bytes:
     """
     Serializa obj a bytes.
 
@@ -1028,6 +1344,9 @@ def dumps(obj: Any, *, with_crc: bool = False,
               criptográfica. Verificado en loads() con la misma clave.
               Mutuamente exclusivo con with_crc (HMAC es estrictamente
               superior).
+    max_depth: profundidad máxima de anidamiento (default MAX_DEPTH). Este
+               parámetro es el knob soportado; reasignar mscs.MAX_DEPTH no
+               tiene efecto.
     """
     if with_crc and hmac_key is not None:
         raise MSCEncodeError(
@@ -1042,7 +1361,7 @@ def dumps(obj: Any, *, with_crc: bool = False,
     if hmac_key is not None:
         flags |= 0x02
     buf.write(struct.pack('B', flags))
-    enc = _Encoder(buf)
+    enc = _Encoder(buf, max_depth=max_depth)
     enc.encode(obj)
     data = buf.getvalue()
     if with_crc:
@@ -1055,7 +1374,9 @@ def dumps(obj: Any, *, with_crc: bool = False,
 
 
 def loads(data: bytes, *, strict: bool = True,
-          hmac_key: Optional[bytes] = None) -> Any:
+          hmac_key: Optional[bytes] = None,
+          max_size: Optional[int] = None,
+          max_depth: Optional[int] = None) -> Any:
     """
     Deserializa bytes a objeto.
 
@@ -1063,9 +1384,28 @@ def loads(data: bytes, *, strict: bool = True,
     strict=False: clases no registradas retornan dict fallback.
     hmac_key: si se proporciona, verifica HMAC-SHA256 antes de deserializar.
               Lanza MSCSecurityError si la firma no coincide.
+    max_size: tope del blob TOTAL (default MAX_SIZE). Acota la suma de todos
+              los campos, no solo cada campo individual; el blob se rechaza
+              antes de decodificar si lo excede. Ajústalo bajo para entrada
+              no confiable (el pico de memoria es un múltiplo por el overhead
+              de objetos Python).
+    max_depth: profundidad máxima de anidamiento (default MAX_DEPTH).
+
+    max_size y max_depth son los knobs soportados; reasignar mscs.MAX_SIZE /
+    mscs.MAX_DEPTH no tiene efecto (son nombres re-exportados, no los globals
+    que lee _core).
     """
+    size_limit = MAX_SIZE if max_size is None else max_size
     if len(data) < 6:
         raise MSCDecodeError("Datos demasiado cortos para ser MSC Serial")
+    # Tope total ANTES del dispatch de versión: acota v1 y v2 por igual y
+    # rechaza el payload entero (muchos campos individualmente válidos cuya
+    # suma excede el límite) sin construir estructuras encima.
+    if len(data) > size_limit:
+        raise MSCDecodeError(
+            f"Payload excede el tamaño máximo: {len(data):,} > {size_limit:,} bytes. "
+            f"Sube max_size si el dato es confiable."
+        )
     if data[:4] != MAGIC:
         raise MSCDecodeError(f"Magic bytes inválidos: {data[:4]!r}")
     ver = data[4:5]
@@ -1085,8 +1425,8 @@ def loads(data: bytes, *, strict: bool = True,
         buf.seek(5)
         # Respeta el strict del llamante: forzar strict=False sería otro
         # downgrade silencioso de la política de seguridad solicitada.
-        dec = _Decoder(buf, strict=strict)
-        return dec.decode()
+        dec = _Decoder(buf, strict=strict, max_depth=max_depth)
+        return dec.assert_fully_resolved(dec.decode())
 
     if ver != VERSION:
         raise MSCDecodeError(f"Versión no soportada: {ver!r}")
@@ -1134,8 +1474,8 @@ def loads(data: bytes, *, strict: bool = True,
 
     buf = io.BytesIO(decode_data)
     buf.seek(6)  # skip header
-    dec = _Decoder(buf, strict=strict)
-    result = dec.decode()
+    dec = _Decoder(buf, strict=strict, max_depth=max_depth)
+    result = dec.assert_fully_resolved(dec.decode())
 
     # ── Validar que no hay trailing bytes ──
     consumed = buf.tell()
@@ -1149,15 +1489,31 @@ def loads(data: bytes, *, strict: bool = True,
 
 
 def dump(obj: Any, file, *, with_crc: bool = False,
-         hmac_key: Optional[bytes] = None) -> None:
+         hmac_key: Optional[bytes] = None,
+         max_depth: Optional[int] = None) -> None:
     """Serializa obj al archivo (modo binario)."""
-    file.write(dumps(obj, with_crc=with_crc, hmac_key=hmac_key))
+    file.write(dumps(obj, with_crc=with_crc, hmac_key=hmac_key,
+                     max_depth=max_depth))
 
 
 def load(file, *, strict: bool = True,
-         hmac_key: Optional[bytes] = None) -> Any:
-    """Deserializa desde archivo (modo binario)."""
-    return loads(file.read(), strict=strict, hmac_key=hmac_key)
+         hmac_key: Optional[bytes] = None,
+         max_size: Optional[int] = None,
+         max_depth: Optional[int] = None) -> Any:
+    """Deserializa desde archivo (modo binario).
+
+    Lee como máximo max_size+1 bytes: un archivo mayor se rechaza sin
+    materializarlo entero, en vez de asignar gigabytes antes del chequeo.
+    """
+    size_limit = MAX_SIZE if max_size is None else max_size
+    data = file.read(size_limit + 1)
+    if len(data) > size_limit:
+        raise MSCDecodeError(
+            f"Archivo excede el tamaño máximo: >{size_limit:,} bytes. "
+            f"Sube max_size si el dato es confiable."
+        )
+    return loads(data, strict=strict, hmac_key=hmac_key,
+                 max_size=size_limit, max_depth=max_depth)
 
 
 def dump_compressed(obj: Any, file, level: int = 6, **kwargs) -> None:
@@ -1168,42 +1524,112 @@ def dump_compressed(obj: Any, file, level: int = 6, **kwargs) -> None:
     file.write(compressed)
 
 
-def load_compressed(file, **kwargs) -> Any:
-    """Deserializa desde archivo comprimido."""
-    orig_size = struct.unpack('<I', file.read(4))[0]
-    if orig_size > MAX_SIZE:
-        raise MSCDecodeError(f"Tamaño original excede límite: {orig_size:,}")
-    compressed = file.read(MAX_COMPRESSED + 1)
-    if len(compressed) > MAX_COMPRESSED:
+def _zlib_compress_bound(n: int) -> int:
+    """Cota superior del tamaño comprimido de n bytes — la misma fórmula
+    que `compressBound()` de zlib. Los datos incompresibles crecen al
+    comprimirse (cabecera + ADLER32 + overhead por bloque), así que esta
+    cota es el máximo legítimo que un stream que descomprime a n bytes
+    puede ocupar comprimido."""
+    return n + (n >> 12) + (n >> 14) + (n >> 25) + 13
+
+
+def load_compressed(file, *, max_size: Optional[int] = None, **kwargs) -> Any:
+    """Deserializa desde archivo comprimido.
+
+    max_size acota la lectura comprimida (además de MAX_COMPRESSED), la salida
+    descomprimida y el blob que se pasa a loads(); una zip-bomb se aborta
+    durante la descompresión (pico ~max_size, no el tamaño real de la bomba).
+
+    Integridad del contenedor (tan estricta como loads() con el payload):
+    rechaza encabezado truncado, stream zlib corrupto o incompleto (checksum
+    ADLER32 no verificado), bytes tras el stream, y un orig_size que no
+    coincida con el tamaño real descomprimido. Todo error crudo de zlib se
+    envuelve en MSCDecodeError.
+    """
+    size_limit = MAX_SIZE if max_size is None else max_size
+    header = file.read(4)
+    if len(header) < 4:
         raise MSCDecodeError(
-            f"Datos comprimidos exceden límite: {len(compressed):,} > {MAX_COMPRESSED:,}"
+            f"Encabezado comprimido truncado: se esperaban 4 bytes, "
+            f"se obtuvieron {len(header)}"
+        )
+    orig_size = struct.unpack('<I', header)[0]
+    if orig_size > size_limit:
+        raise MSCDecodeError(f"Tamaño original excede límite: {orig_size:,}")
+    # La lectura del blob comprimido se acota por el MENOR de MAX_COMPRESSED
+    # (techo absoluto) y la cota superior de zlib para size_limit bytes: bajar
+    # max_size reduce así el pico de memoria del lado comprimido. Se usa
+    # compressBound (no size_limit a secas) porque los datos incompresibles
+    # (aleatorios, cifrados, ya comprimidos) crecen ~0.03% + overhead de
+    # bloques al comprimirse — acotar al tamaño crudo rechazaría un
+    # dump_compressed legítimo cuyo max_size se ajusta al tamaño real.
+    comp_limit = min(MAX_COMPRESSED, _zlib_compress_bound(size_limit))
+    compressed = file.read(comp_limit + 1)
+    if len(compressed) > comp_limit:
+        raise MSCDecodeError(
+            f"Datos comprimidos exceden límite: {len(compressed):,} > {comp_limit:,}"
         )
     # Descompresión incremental con tope duro. zlib.decompress() materializa
     # TODA la salida antes de que se pueda medir (bufsize es una pista, no un
     # límite), así que una zip-bomb agota memoria pese al chequeo posterior.
-    # Descomprimir acotando la salida y abortar al cruzar MAX_SIZE mantiene el
-    # pico de memoria en ~MAX_SIZE en vez del tamaño real de la bomba.
+    # Descomprimir acotando la salida y abortar al cruzar size_limit mantiene
+    # el pico de memoria en ~size_limit en vez del tamaño real de la bomba.
+    # zlib.error (magic inválido, deflate corrupto, ADLER32 que no cuadra) se
+    # envuelve en MSCDecodeError: fail-closed, sin filtrar el error crudo.
     decompressor = zlib.decompressobj()
     out = bytearray()
     buf = compressed
-    while buf:
-        out += decompressor.decompress(buf, MAX_SIZE + 1 - len(out))
-        if len(out) > MAX_SIZE:
-            raise MSCDecodeError(
-                f"Datos descomprimidos exceden límite: >{MAX_SIZE:,}"
-            )
-        buf = decompressor.unconsumed_tail
-    out += decompressor.flush()
-    if len(out) > MAX_SIZE:
+    try:
+        while buf:
+            out += decompressor.decompress(buf, size_limit + 1 - len(out))
+            if len(out) > size_limit:
+                raise MSCDecodeError(
+                    f"Datos descomprimidos exceden límite: >{size_limit:,}"
+                )
+            buf = decompressor.unconsumed_tail
+        out += decompressor.flush()
+    except zlib.error as e:
+        raise MSCDecodeError(f"Stream zlib inválido o corrupto: {e}") from e
+    if len(out) > size_limit:
         raise MSCDecodeError(
-            f"Datos descomprimidos exceden límite: >{MAX_SIZE:,}"
+            f"Datos descomprimidos exceden límite: >{size_limit:,}"
         )
-    return loads(bytes(out), **kwargs)
+    # ── Integridad del stream zlib (fail-closed, como el trailing-bytes de
+    # loads()) ──
+    # eof: el marcador de fin de stream se alcanzó y el ADLER32 se verificó.
+    # Un stream truncado (p. ej. sin el checksum) deja eof=False con datos
+    # parciales que de otro modo pasarían como válidos.
+    if not decompressor.eof:
+        raise MSCDecodeError(
+            "Stream zlib incompleto o truncado (checksum no verificado). "
+            "Contenedor comprimido corrupto."
+        )
+    # unused_data: bytes tras el final del stream — basura o contenedores
+    # concatenados. Rechazar es coherente con la validación de trailing bytes
+    # que loads() aplica al payload descomprimido.
+    if decompressor.unused_data:
+        raise MSCDecodeError(
+            f"Bytes tras el stream comprimido: {len(decompressor.unused_data):,}. "
+            f"Contenedor corrupto o manipulado."
+        )
+    # orig_size es el tamaño declarado por dump_compressed; debe coincidir con
+    # el real. Una discrepancia señala corrupción o un encabezado forjado.
+    if len(out) != orig_size:
+        raise MSCDecodeError(
+            f"orig_size no coincide: declarado {orig_size:,}, "
+            f"real {len(out):,}. Contenedor corrupto o manipulado."
+        )
+    return loads(bytes(out), max_size=size_limit, **kwargs)
 
 
 def copy(obj: Any) -> Any:
     """Deep copy vía serialización round-trip. Más seguro que copy.deepcopy."""
-    return loads(dumps(obj), strict=False)
+    data = dumps(obj)
+    # El tope de tamaño protege contra ENTRADA no confiable; copiar un objeto
+    # propio no lo es. Se acota a los bytes recién producidos para no romper
+    # copias grandes: MAX_SIZE limita el blob TOTAL, y un único campo cercano
+    # a MAX_SIZE (p. ej. un ndarray) suma el framing y cruzaría el default.
+    return loads(data, strict=False, max_size=len(data))
 
 
 # ────────────────────── UTILIDADES ────────────────────────────────

@@ -1,6 +1,6 @@
 # MSCS — Safe Serialization for Python
 
-**v2.4.1** | [Changelog](CHANGELOG.md) | [PyPI](https://pypi.org/project/mscs/)
+**v2.5.0** | [Changelog](CHANGELOG.md) | [PyPI](https://pypi.org/project/mscs/)
 
 > **Status: Beta** — API is stable but the format may evolve. Not yet battle-tested in large-scale production.
 
@@ -167,13 +167,13 @@ mscs.loads(unsigned_data, hmac_key=key)  # MSCSecurityError: anti-downgrade prot
 |------|-------|
 | `None`, `bool`, `int`, `float`, `complex` | Ints up to 8192 bytes (~19,700 digits) |
 | `str`, `bytes`, `bytearray` | UTF-8, ref-tracked |
-| `list`, `tuple`, `dict`, `set`, `frozenset`, `deque` | Circular refs supported; `deque` preserves `maxlen` |
+| `list`, `tuple`, `dict`, `set`, `frozenset`, `deque` | Circular refs supported (including cycles through tuples); `deque` preserves `maxlen` |
 | `datetime`, `date`, `time`, `timedelta` | ISO 8601 |
 | `Decimal`, `UUID`, `Path` | Lossless |
 | `Enum` | Must be registered |
 | `numpy.ndarray` | dtype whitelist enforced |
 | `torch.Tensor` | Auto CPU transfer, preserves requires_grad |
-| `dataclass` (incl. `frozen`), `__slots__`, `__dict__` objects | Must be registered |
+| `dataclass` (incl. `frozen`), `__slots__`, `__dict__` objects | Must be registered; circular refs supported (self/mutual references, cycles through tuples). `__slots__` handled in full: string form, inheritance, private (name-mangled) slots, and hybrid slots+`__dict__` classes. One exception fails closed: a custom `__setstate__` whose state contains a reference to a tuple still under construction raises `MSCDecodeError` — break such cycles through a mutable container |
 
 ## Performance
 
@@ -200,21 +200,35 @@ mscs provides a **defense-in-depth** approach, but it is **not a sandbox**. Unde
 1. **No dynamic imports**: Class names in the binary stream are only used as registry lookup keys — never passed to `importlib`
 2. **Explicit registry**: Custom classes must be registered before deserialization; unregistered classes raise `MSCSecurityError`
 3. **NumPy dtype whitelist**: Blocks `object`, `void`, and structured dtypes that could execute code
-4. **Configurable limits**: `MAX_DEPTH=256`, `MAX_SIZE=512MB`, `MAX_COLLECTION=10M`, `MAX_INT_BYTES=8192`
-5. **Anti zip-bomb**: `load_compressed` caps the compressed input and decompresses **incrementally** against a hard `MAX_SIZE` limit, aborting as soon as it is crossed — a bomb cannot exhaust memory before the size check
-6. **Path null byte rejection**: Paths containing null bytes are rejected
-7. **CRC32 corruption detection**: Optional checksum to detect accidental data corruption (not cryptographic — an attacker can forge CRC32)
-8. **HMAC-SHA256 authentication**: Optional cryptographic signature to detect intentional tampering. Anti-downgrade protection rejects any payload lacking a valid HMAC when a key is supplied — including the legacy **v1** format — so an attacker cannot strip or version-downgrade the signature.
-9. **Trailing bytes rejection**: Payloads with unexpected bytes after the serialized object are rejected
-10. **Integer size limit**: Ints larger than `MAX_INT_BYTES` (8192 bytes, ~19,700 digits) are rejected to prevent CPU exhaustion attacks
+4. **Total-size and depth limits**: `loads()`/`load()` reject any blob larger than `max_size` (default `MAX_SIZE=512MB`) **before decoding** — this bounds the *sum* of all fields, not just each field individually (every decoded string/collection lives inside the input). The limit is on the whole encoded blob (data + framing), so the largest round-trippable single field is slightly below `max_size`; pass a larger `max_size` to load trusted data at that edge. `load()` reads at most `max_size+1` bytes, so an oversized file is never materialized. Other per-field caps: `MAX_COLLECTION=10M` elements per collection, `MAX_STRING=100MB` per string/bytes, `MAX_INT_BYTES=8192`, `MAX_DEPTH=256` nesting. Peak memory is a **multiple** of `max_size` (Python object overhead is ~6× for tiny primitives, plus transient copies during decompression), so set `max_size` conservatively for untrusted input — e.g. `loads(data, max_size=50*1024*1024)`
+5. **Anti zip-bomb**: `load_compressed` bounds **both** the compressed read and the decompressed output to `max_size` (the compressed read additionally capped by `MAX_COMPRESSED`) and decompresses **incrementally**, aborting the moment the output crosses the limit — a bomb cannot exhaust memory before the size check, and lowering `max_size` lowers peak memory on both sides
+6. **Compressed-container integrity**: `load_compressed` verifies the zlib stream ended cleanly (checksum validated), rejects trailing bytes and concatenated streams, and checks the decompressed length against the declared header — a truncated, forged, or padded container fails closed with `MSCDecodeError` instead of yielding partial data
+7. **Path null byte rejection**: Paths containing null bytes are rejected
+8. **CRC32 corruption detection**: Optional checksum to detect accidental data corruption (not cryptographic — an attacker can forge CRC32)
+9. **HMAC-SHA256 authentication**: Optional cryptographic signature to detect intentional tampering. Anti-downgrade protection rejects any payload lacking a valid HMAC when a key is supplied — including the legacy **v1** format — so an attacker cannot strip or version-downgrade the signature.
+10. **Trailing bytes rejection**: Payloads with unexpected bytes after the serialized object are rejected
+11. **Integer size limit**: Ints larger than `MAX_INT_BYTES` (8192 bytes, ~19,700 digits) are rejected to prevent CPU exhaustion attacks
+12. **Forged forward-ref rejection**: Payloads referencing a container still under construction from an unpatchable position (dict key, set/frozenset member, self-referential root tuple) fail closed with `MSCDecodeError` — and `loads()` verifies no unresolved placeholder survives decoding. The encoder can never produce these shapes
 
 ### What mscs does NOT prevent
 
 1. **`__setstate__` execution**: If you register a class that implements `__setstate__`, that method **will execute** during deserialization. Only register classes you trust.
 2. **Path traversal**: Deserialized `Path` objects may contain `../` sequences. The consumer must validate paths before using them for file I/O.
 3. **Malicious registered classes**: The security boundary is the registry. If you register a class with dangerous behavior in `__init__`, `__setstate__`, or property setters, mscs cannot protect you.
+4. **Bounded-but-not-tiny memory**: the size limit bounds the input, but peak memory is a multiple of it — decoding expands compact bytes into Python objects (~6× for tiny primitives), and decompression holds transient copies. Budget for a few times `max_size`, and lower `max_size` for untrusted input.
 
-**Rule of thumb**: mscs is safe for deserializing untrusted *data* as long as your registry only contains trusted *classes*.
+### Configuring limits
+
+Pass `max_size` / `max_depth` per call — these are the supported, thread-safe knobs:
+
+```python
+obj = mscs.loads(untrusted, max_size=50 * 1024 * 1024, max_depth=64)
+mscs.dumps(obj, max_depth=64)
+```
+
+> **Note:** rebinding the module constant (`mscs.MAX_DEPTH = 1`) has **no effect** — it is a re-exported name, not the global the encoder/decoder read. Use the parameters above.
+
+**Rule of thumb**: mscs is safe for deserializing untrusted *data* as long as your registry only contains trusted *classes* and you set `max_size` to fit your memory budget.
 
 ## Binary Format
 

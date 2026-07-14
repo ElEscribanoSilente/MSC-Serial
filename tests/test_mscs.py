@@ -196,6 +196,539 @@ class TestCircularReferences:
         result = mscs.loads(data, strict=False)
         assert result["a"] is result["b"]
 
+    def test_shared_tuple_reference(self):
+        x = (1, 2)
+        val = [x, x]
+        result = mscs.loads(mscs.dumps(val), strict=False)
+        assert result[0] is result[1]
+        assert result[0] == (1, 2)
+
+    def test_tuple_cycle(self):
+        # Ciclo que atraviesa una tupla: root -> lista -> root
+        child = []
+        root = (child,)
+        child.append(root)
+        result = mscs.loads(mscs.dumps(root), strict=False)
+        assert isinstance(result, tuple)
+        assert result[0][0] is result
+
+    def test_nested_tuple_cycle(self):
+        # La tupla interior queda pendiente hasta que la exterior se resuelve
+        inner_list = []
+        root = (inner_list,)
+        inner_list.append((root, 42))
+        result = mscs.loads(mscs.dumps(root), strict=False)
+        assert result[0][0][1] == 42
+        assert result[0][0][0] is result
+
+    def test_tuple_cycle_multiple_pending_slots(self):
+        # Una tupla con DOS slots pendientes hacia el mismo ancestro
+        holder = []
+        root = (holder,)
+        holder.append((root, root))
+        result = mscs.loads(mscs.dumps(root), strict=False)
+        inner = result[0][0]
+        assert inner[0] is result
+        assert inner[1] is result
+
+    def test_dict_value_tuple_cycle(self):
+        d = {}
+        t = (d,)
+        d["t"] = t
+        result = mscs.loads(mscs.dumps(t), strict=False)
+        assert result[0]["t"] is result
+
+    def test_deque_tuple_cycle(self):
+        import collections
+        dq = collections.deque()
+        t = (dq,)
+        dq.append(t)
+        result = mscs.loads(mscs.dumps(t), strict=False)
+        assert result[0][0] is result
+
+    def test_registered_object_self_reference(self):
+        @mscs.register
+        class SelfRefNode:
+            pass
+
+        n = SelfRefNode()
+        n.me = n
+        result = mscs.loads(mscs.dumps(n))
+        assert isinstance(result, SelfRefNode)
+        assert result.me is result
+
+    def test_registered_objects_mutual_reference(self):
+        @mscs.register
+        class MutualA:
+            pass
+
+        @mscs.register
+        class MutualB:
+            pass
+
+        a = MutualA()
+        b = MutualB()
+        a.other = b
+        b.other = a
+        result = mscs.loads(mscs.dumps(a))
+        assert isinstance(result.other, MutualB)
+        assert result.other.other is result
+
+    def test_object_in_tuple_cycle(self):
+        @mscs.register
+        class TupleCycleNode:
+            pass
+
+        n = TupleCycleNode()
+        root = (n,)
+        n.me = root
+        result = mscs.loads(mscs.dumps(root))
+        assert result[0].me is result
+
+    def test_slots_object_in_tuple_cycle(self):
+        @mscs.register
+        class SlotsCycleNode:
+            __slots__ = ("me",)
+
+        n = SlotsCycleNode()
+        t = (n,)
+        n.me = t
+        result = mscs.loads(mscs.dumps(t))
+        assert result[0].me is result
+
+    def test_frozen_dataclass_in_tuple_cycle(self):
+        @mscs.register
+        @dataclasses.dataclass(frozen=True)
+        class FrozenCycleNode:
+            x: object = None
+
+        n = FrozenCycleNode()
+        t = (n,)
+        object.__setattr__(n, "x", t)
+        result = mscs.loads(mscs.dumps(t))
+        assert result[0].x is result
+
+    def test_setstate_object_direct_cycle(self):
+        # __setstate__ custom con auto-referencia directa (sin tupla):
+        # la instancia existe antes de decodificar el estado.
+        @mscs.register
+        class StatefulNode:
+            def __getstate__(self):
+                return {"me": self.me}
+
+            def __setstate__(self, state):
+                self.me = state["me"]
+
+        n = StatefulNode()
+        n.me = n
+        result = mscs.loads(mscs.dumps(n))
+        assert result.me is result
+
+    def test_setstate_object_in_tuple_cycle_fails_closed(self):
+        # Un __setstate__ custom recibiría el sentinela de una tupla aún en
+        # construcción: irresoluble sin corrupción -> error explícito.
+        @mscs.register
+        class OpaqueStateNode:
+            def __getstate__(self):
+                return {"t": self.t}
+
+            def __setstate__(self, state):
+                self.t = state["t"]
+
+        n = OpaqueStateNode()
+        t = (n,)
+        n.t = t
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(mscs.dumps(t))
+
+    def test_unregistered_fallback_self_reference(self):
+        class UnregisteredCycleNode:
+            pass
+
+        n = UnregisteredCycleNode()
+        n.me = n
+        result = mscs.loads(mscs.dumps(n), strict=False)
+        assert result["__state__"]["me"] is result
+
+    def test_unregistered_fallback_tuple_cycle(self):
+        class UnregisteredTupleNode:
+            pass
+
+        n = UnregisteredTupleNode()
+        root = (n,)
+        n.me = root
+        result = mscs.loads(mscs.dumps(root), strict=False)
+        assert result[0]["__state__"]["me"] is result
+
+    def test_custom_setattr_never_sees_pending(self):
+        # El __setattr__ de usuario debe ver UNA asignación con el valor
+        # real, nunca el sentinela interno de una tupla en construcción.
+        seen = []
+
+        @mscs.register
+        class AuditedSlotsNode:
+            __slots__ = ("me",)
+
+            def __setattr__(self, k, v):
+                seen.append(type(v).__name__)
+                object.__setattr__(self, k, v)
+
+        n = AuditedSlotsNode()
+        t = (n,)
+        object.__setattr__(n, "me", t)
+        result = mscs.loads(mscs.dumps(t))
+        assert result[0].me is result
+        assert seen == ["tuple"], f"__setattr__ vio: {seen}"
+
+    def test_property_setter_never_sees_pending(self):
+        # Un data descriptor (property) invocado vía object.__setattr__ en
+        # la rama dataclass tampoco debe ver el sentinela.
+        seen = []
+
+        @mscs.register
+        @dataclasses.dataclass
+        class ShadowedFieldNode:
+            me: object = None
+
+        def _get(self):
+            return self.__dict__.get("me")
+
+        def _set(self, v):
+            seen.append(type(v).__name__)
+            self.__dict__["me"] = v
+
+        ShadowedFieldNode.me = property(_get, _set)
+
+        d = ShadowedFieldNode.__new__(ShadowedFieldNode)
+        t = (d,)
+        d.__dict__["me"] = t
+        result = mscs.loads(mscs.dumps(t))
+        assert result[0].me is result
+        assert seen == ["tuple"], f"property.__set__ vio: {seen}"
+
+    def test_setstate_copying_nested_pending_attr_fails_closed(self):
+        # __setstate__ que LEE un atributo aún no parcheado de un objeto
+        # anidado (en ciclo vía tupla) debe fallar visible, no recibir ni
+        # copiar el sentinela interno.
+        @mscs.register
+        class InnerBack:
+            pass
+
+        @mscs.register
+        class CopierNode:
+            def __getstate__(self):
+                return {"peer": self.peer}
+
+            def __setstate__(self, state):
+                self.peer = state["peer"]
+                self.snapshot = self.peer.back  # lee en pleno decode
+
+        b = InnerBack()
+        a = CopierNode()
+        a.peer = b
+        root = (a,)
+        b.back = root
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(mscs.dumps(root))
+
+    def test_setstate_holding_nested_object_resolves_after_load(self):
+        # Variante resoluble del caso anterior: __setstate__ solo guarda la
+        # referencia sin leer el atributo pendiente — el fix-up lo parchea
+        # y el grafo final queda correcto.
+        @mscs.register
+        class InnerBack2:
+            pass
+
+        @mscs.register
+        class HolderNode:
+            def __getstate__(self):
+                return {"peer": self.peer}
+
+            def __setstate__(self, state):
+                self.peer = state["peer"]
+
+        b = InnerBack2()
+        a = HolderNode()
+        a.peer = b
+        root = (a,)
+        b.back = root
+        result = mscs.loads(mscs.dumps(root))
+        assert result[0].peer.back is result
+
+
+class TestForgedPendingRefs:
+    """Payloads forjados con _REF hacia slots aún en construcción.
+
+    Ninguno es producible por el encoder (exigirían hashear un ciclo o
+    resolver una tupla contra sí misma): deben fallar cerrado, nunca
+    entregar un placeholder o corromper silenciosamente.
+    """
+
+    def test_self_referential_root_tuple(self):
+        # TUPLE(n=1) cuyo único item es _REF a su propio slot: deadlock
+        payload = HEADER + _TUPLE + struct.pack('<I', 1) + _REF + struct.pack('<I', 0)
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(payload)
+
+    def test_pending_ref_as_dict_key(self):
+        # TUPLE(n=1)[ DICT(n=1){ _REF 0: None } ]
+        payload = (
+            HEADER + _TUPLE + struct.pack('<I', 1)
+            + _DICT + struct.pack('<I', 1)
+            + _REF + struct.pack('<I', 0)
+            + _NONE
+        )
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(payload)
+
+    def test_pending_ref_in_set(self):
+        # TUPLE(n=1)[ SET(n=1){ _REF 0 } ]
+        payload = (
+            HEADER + _TUPLE + struct.pack('<I', 1)
+            + _SET + struct.pack('<I', 1)
+            + _REF + struct.pack('<I', 0)
+        )
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(payload)
+
+    def test_pending_ref_in_frozenset(self):
+        # TUPLE(n=1)[ FROZENSET(n=1){ _REF 0 } ]
+        payload = (
+            HEADER + _TUPLE + struct.pack('<I', 1)
+            + _FROZENSET + struct.pack('<I', 1)
+            + _REF + struct.pack('<I', 0)
+        )
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(payload)
+
+    def test_self_referential_frozenset(self):
+        # FROZENSET(n=1){ _REF 0 } directo, sin tupla exterior
+        payload = HEADER + _FROZENSET + struct.pack('<I', 1) + _REF + struct.pack('<I', 0)
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(payload)
+
+    @pytest.mark.parametrize("strict", [True, False])
+    def test_pending_ref_as_enum_value(self, strict):
+        # TUPLE(n=1)[ ENUM(path, _REF 0) ]: en strict=False el sentinela
+        # escaparia dentro del dict {'__enum__', '__value__'} sin fix-up
+        path_bytes = b"forged.module.NoSuchEnum"
+        payload = (
+            HEADER + _TUPLE + struct.pack('<I', 1)
+            + _ENUM + _STR + struct.pack('<I', len(path_bytes)) + path_bytes
+            + _REF + struct.pack('<I', 0)
+        )
+        with pytest.raises((mscs.MSCDecodeError, mscs.MSCSecurityError)):
+            mscs.loads(payload, strict=strict)
+
+
+class TestSlotsRoundtrip:
+    """Extracción/restauración de __slots__: string, herencia, híbridas,
+    name mangling, __dict__/__weakref__ declarados en slots."""
+
+    def test_slots_declared_as_string(self):
+        @mscs.register
+        class OneSlotStr:
+            __slots__ = "value"
+
+            def __init__(self):
+                self.value = 7
+
+        d = mscs.loads(mscs.dumps(OneSlotStr()))
+        assert d.value == 7
+
+    def test_inherited_slot_in_hybrid_class(self):
+        class SlotBaseH:
+            __slots__ = ("x",)
+
+        @mscs.register
+        class HybridH(SlotBaseH):
+            pass
+
+        obj = HybridH()
+        obj.x = 1
+        obj.y = 2
+        d = mscs.loads(mscs.dumps(obj))
+        assert d.x == 1
+        assert d.y == 2
+
+    def test_slot_with_name_mangling(self):
+        @mscs.register
+        class SecretSlot:
+            __slots__ = ("__token",)
+
+            def __init__(self):
+                self.__token = "abc"
+
+            def get_token(self):
+                return self.__token
+
+        d = mscs.loads(mscs.dumps(SecretSlot()))
+        assert d.get_token() == "abc"
+
+    def test_slot_mangling_class_with_leading_underscore(self):
+        @mscs.register
+        class _PrivSlot:
+            __slots__ = ("__k",)
+
+            def __init__(self):
+                self.__k = 5
+
+            def get_k(self):
+                return self.__k
+
+        d = mscs.loads(mscs.dumps(_PrivSlot()))
+        assert d.get_k() == 5
+
+    def test_slots_declaring_dict_and_weakref(self):
+        @mscs.register
+        class DictInSlots:
+            __slots__ = ("x", "__dict__", "__weakref__")
+
+        w = DictInSlots()
+        w.x = 10
+        w.dynamic = 20
+        d = mscs.loads(mscs.dumps(w))
+        assert d.x == 10
+        assert d.dynamic == 20
+
+    def test_unset_slot_stays_unset(self):
+        @mscs.register
+        class PartialSlotsRT:
+            __slots__ = ("a", "b")
+
+        p = PartialSlotsRT()
+        p.a = 1
+        d = mscs.loads(mscs.dumps(p))
+        assert d.a == 1
+        assert not hasattr(d, "b")
+
+    def test_multilevel_slot_inheritance(self):
+        class SlotL1:
+            __slots__ = ("a",)
+
+        class SlotL2(SlotL1):
+            __slots__ = ("b",)
+
+        @mscs.register
+        class SlotL3(SlotL2):
+            __slots__ = ("c",)
+
+        obj = SlotL3()
+        obj.a, obj.b, obj.c = 1, 2, 3
+        d = mscs.loads(mscs.dumps(obj))
+        assert (d.a, d.b, d.c) == (1, 2, 3)
+
+    def test_hybrid_class_in_tuple_cycle(self):
+        # Interacción con la resolución de ciclos: el slot heredado se
+        # restaura vía setattr y el fix-up parchea el hueco de la tupla.
+        class SlotBaseCycle:
+            __slots__ = ("ref",)
+
+        @mscs.register
+        class HybridCycleNode(SlotBaseCycle):
+            pass
+
+        h = HybridCycleNode()
+        t = (h,)
+        h.ref = t
+        h.tag = "d"
+        d = mscs.loads(mscs.dumps(t))
+        assert d[0].ref is d
+        assert d[0].tag == "d"
+
+    def test_slots_dict_value_shadowed_by_slot(self):
+        # En una híbrida, una clave espuria de __dict__ homónima de un slot
+        # es inaccesible (el descriptor gana): se serializa el valor efectivo.
+        class SlotBaseShadow:
+            __slots__ = ("x",)
+
+        @mscs.register
+        class HybridShadow(SlotBaseShadow):
+            pass
+
+        obj = HybridShadow()
+        obj.x = 1
+        obj.__dict__["x"] = 99  # inaccesible vía atributo
+        assert obj.x == 1
+        d = mscs.loads(mscs.dumps(obj))
+        assert d.x == 1
+
+    def test_hybrid_spurious_dict_key_is_faithful(self):
+        # Una clave literal "__dict__" dentro del __dict__ de instancia es
+        # legal: debe restaurarse como clave, jamás pasar por setattr (que
+        # reemplazaría el dict del objeto entero).
+        class SlotBaseSpur:
+            __slots__ = ("x",)
+
+        @mscs.register
+        class HybridSpur(SlotBaseSpur):
+            pass
+
+        obj = HybridSpur()
+        obj.x = 1
+        obj.__dict__["__dict__"] = "weird but legal"
+        obj.__dict__["__weakref__"] = "also legal"
+        d = mscs.loads(mscs.dumps(obj))
+        assert d.x == 1
+        assert d.__dict__["__dict__"] == "weird but legal"
+        assert d.__dict__["__weakref__"] == "also legal"
+
+    def test_hybrid_spurious_dict_key_no_clobbering(self):
+        # El valor dict de una clave espuria "__dict__" no debe pisar ni
+        # inyectar atributos reales.
+        class SlotBaseClob:
+            __slots__ = ("x",)
+
+        @mscs.register
+        class HybridClob(SlotBaseClob):
+            pass
+
+        obj = HybridClob()
+        obj.x = 1
+        obj.y = 2
+        obj.__dict__["__dict__"] = {"evil": "payload", "y": "clobbered"}
+        d = mscs.loads(mscs.dumps(obj))
+        assert d.y == 2
+        assert not hasattr(d, "evil")
+        assert d.__dict__["__dict__"] == {"evil": "payload", "y": "clobbered"}
+
+    def test_hybrid_spurious_dict_key_no_aliasing(self):
+        # El __dict__ del objeto decodificado nunca debe SER otro objeto
+        # del grafo (aliasing de identidad vía setattr('__dict__', ...)).
+        class SlotBaseAlias:
+            __slots__ = ("x",)
+
+        @mscs.register
+        class HybridAlias(SlotBaseAlias):
+            pass
+
+        obj = HybridAlias()
+        obj.x = 1
+        shared = {"k": "v"}
+        obj.__dict__["__dict__"] = shared
+        h2, shared2 = mscs.loads(mscs.dumps([obj, shared]))
+        assert h2.__dict__ is not shared2
+        assert h2.__dict__["__dict__"] is shared2  # la ref compartida, como valor
+
+    def test_forged_dict_key_on_pure_slots_fails_closed(self):
+        # Payload forjado: clase slots-pura registrada con una clave
+        # "__dict__" en el estado -> setattr -> AttributeError -> error.
+        @mscs.register
+        class PureSlotsForged:
+            __slots__ = ("a",)
+
+        path = _class_key(PureSlotsForged).encode()
+        key = b"__dict__"
+        payload = (
+            HEADER + _OBJ
+            + _STR + struct.pack('<I', len(path)) + path
+            + _DICT + struct.pack('<I', 1)
+            + _STR + struct.pack('<I', len(key)) + key
+            + _NONE
+        )
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(payload)
+
 
 # ═══════════════════════════════════════════════════════════════════
 # NUMPY TESTS
@@ -449,6 +982,265 @@ class TestResourceExhaustion:
         payload += _NONE
         with pytest.raises(mscs.MSCDecodeError):
             mscs.loads(payload)
+
+
+class TestTotalSizeLimit:
+    """MAX_SIZE acota el blob total, no solo campos individuales; y los
+    límites relevantes son configurables por llamada (per-call)."""
+
+    def test_loads_rejects_blob_over_max_size(self):
+        # Un blob real por encima de un max_size chico se rechaza ANTES de
+        # decodificar (tope total, no por campo).
+        blob = mscs.dumps([b"x" * 2000])
+        assert len(blob) > 1000
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(blob, max_size=1000)
+
+    def test_loads_accepts_blob_at_max_size_boundary(self):
+        blob = mscs.dumps([1, 2, 3])
+        # Exactamente len(blob) debe pasar; len(blob)-1 debe fallar.
+        assert mscs.loads(blob, max_size=len(blob), strict=False) == [1, 2, 3]
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(blob, max_size=len(blob) - 1)
+
+    def test_cumulative_strings_bounded_by_max_size(self):
+        # El ataque del hallazgo: muchos bytes-strings individualmente
+        # válidos (< MAX_STRING) cuya SUMA excede el tope. Con un max_size
+        # acotado, el blob entero se rechaza.
+        blob = mscs.dumps([b"a" * 100_000 for _ in range(5)])  # ~500 KB
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(blob, max_size=200_000)
+        # Sin acotar (default grande) sigue funcionando.
+        out = mscs.loads(blob, strict=False)
+        assert sum(len(x) for x in out) == 500_000
+
+    def test_load_bounds_file_read(self):
+        # load() no debe materializar un archivo mayor que max_size.
+        blob = mscs.dumps([b"y" * 5000])
+        buf = io.BytesIO(blob)
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.load(buf, max_size=1000)
+
+    def test_load_roundtrip_within_limit(self):
+        blob = mscs.dumps({"a": 1, "b": [2, 3]})
+        buf = io.BytesIO(blob)
+        assert mscs.load(buf, strict=False, max_size=10_000) == {"a": 1, "b": [2, 3]}
+
+    def test_max_depth_configurable_per_call_decode(self):
+        # El knob real: max_depth per-call SÍ afecta el decode.
+        nested = [[[[[1]]]]]
+        blob = mscs.dumps(nested)
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(blob, max_depth=2)
+        assert mscs.loads(blob, max_depth=50, strict=False) == nested
+
+    def test_max_depth_configurable_per_call_encode(self):
+        with pytest.raises(mscs.MSCEncodeError):
+            mscs.dumps([[[[1]]]], max_depth=2)
+
+    def test_module_constant_rebind_has_no_effect(self):
+        # Documentar el footgun: reasignar mscs.MAX_DEPTH NO cambia el
+        # comportamiento; el knob soportado es el parámetro per-call.
+        original = mscs.MAX_DEPTH
+        try:
+            mscs.MAX_DEPTH = 1
+            # Sigue decodificando anidamiento profundo pese al "1".
+            assert mscs.loads(mscs.dumps([[[1]]]), strict=False) == [[[1]]]
+        finally:
+            mscs.MAX_DEPTH = original
+
+    def test_load_compressed_respects_max_size(self):
+        import zlib as _zlib
+        obj = [b"z" * 100_000]
+        raw = mscs.dumps(obj)
+        buf = io.BytesIO()
+        buf.write(struct.pack('<I', len(raw)))
+        buf.write(_zlib.compress(raw))
+        buf.seek(0)
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.load_compressed(buf, max_size=1000)
+
+    def test_v1_blob_over_max_size_rejected(self):
+        # El tope total aplica también a la rama v1 (antes del dispatch).
+        v1_blob = MAGIC + b'\x01' + _LIST + struct.pack('<I', 0)
+        # Un blob v1 legítimo pequeño pasa...
+        assert mscs.loads(v1_blob, strict=False) == []
+        # ...pero uno mayor que max_size se rechaza igual que v2.
+        big_v1 = MAGIC + b'\x01' + _BYTES + struct.pack('<I', 4000) + b'q' * 4000
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(big_v1, strict=False, max_size=1000)
+
+    def test_load_compressed_read_bounded_by_max_size(self):
+        # La lectura del blob COMPRIMIDO se acota por max_size, no solo por
+        # MAX_COMPRESSED: bajar max_size reduce el pico de memoria del lado
+        # comprimido. Un SpyFile registra los tamaños pedidos a read().
+        import zlib as _zlib
+
+        class _SpyFile:
+            def __init__(self, data):
+                self._buf = io.BytesIO(data)
+                self.reads = []
+
+            def read(self, n=-1):
+                self.reads.append(n)
+                return self._buf.read(n)
+
+        raw = mscs.dumps([b"z" * 2000])
+        blob = struct.pack('<I', len(raw)) + _zlib.compress(raw)
+        spy = _SpyFile(blob)
+        mscs.load_compressed(spy, max_size=50_000, strict=False)
+        # Primera lectura: 4 bytes (header orig_size). Segunda: el blob
+        # comprimido, acotado a compressBound(max_size)+1 (holgura de zlib
+        # sobre datos incompresibles), muy por debajo de MAX_COMPRESSED.
+        expected = mscs._core._zlib_compress_bound(50_000) + 1
+        assert spy.reads[0] == 4
+        assert spy.reads[1] == expected, spy.reads
+        assert spy.reads[1] < mscs.MAX_COMPRESSED
+
+    def test_load_compressed_forged_small_header_large_body(self):
+        # orig_size forjado pequeño (pasa) pero cuerpo comprimido grande:
+        # el tope de lectura comprimida por max_size lo rechaza.
+        import zlib as _zlib
+        raw = mscs.dumps(list(range(2000)))
+        body = _zlib.compress(raw)
+        assert len(body) > 1000
+        forged = struct.pack('<I', 10) + body  # miente: dice 10 bytes
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.load_compressed(io.BytesIO(forged), strict=False, max_size=1000)
+
+    def test_total_limit_is_on_blob_including_framing(self, monkeypatch):
+        # MAX_SIZE acota el blob TOTAL (datos + framing). Un único campo cuyo
+        # tamaño crudo llega al límite cruza el default por el framing.
+        monkeypatch.setattr(mscs._core, "MAX_SIZE", 10_000)
+        payload = b"x" * 10_000  # blob = 6 header + 1 tag + 4 len + 10_000
+        blob = mscs.dumps(payload)
+        assert len(blob) > 10_000
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(blob)  # default resuelve a MAX_SIZE=10_000
+
+    def test_copy_not_limited_by_default_max_size(self, monkeypatch):
+        # copy() confía en su propio output: no debe romperse aunque el blob
+        # cruce el MAX_SIZE por defecto (round-trip de objeto propio).
+        monkeypatch.setattr(mscs._core, "MAX_SIZE", 10_000)
+        payload = b"x" * 10_000
+        # loads con default rechaza el blob (datos+framing > MAX_SIZE)...
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(mscs.dumps(payload))
+        # ...pero copy() lo acota a sus propios bytes y funciona.
+        assert mscs.copy(payload) == payload
+
+
+class TestCompressedIntegrity:
+    """load_compressed valida el contenedor comprimido con la misma
+    estrictez que loads() aplica al payload: header completo, stream zlib
+    íntegro, sin bytes finales, orig_size veraz."""
+
+    @staticmethod
+    def _framed(orig_size, body):
+        return io.BytesIO(struct.pack('<I', orig_size) + body)
+
+    def test_roundtrip_baseline(self):
+        obj = [1, 2, 3, "hello", {"k": [4, 5]}]
+        buf = io.BytesIO()
+        mscs.dump_compressed(obj, buf)
+        buf.seek(0)
+        assert mscs.load_compressed(buf, strict=False) == obj
+
+    def test_rejects_fake_orig_size(self):
+        import zlib as _zlib
+        raw = mscs.dumps([1, 2, 3])
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.load_compressed(self._framed(len(raw) + 999, _zlib.compress(raw)),
+                                 strict=False)
+
+    def test_rejects_truncated_zlib_stream(self):
+        # Falta parte del ADLER32 final: el decoder antes devolvía datos
+        # parciales sin error (eof=False no se comprobaba).
+        import zlib as _zlib
+        raw = mscs.dumps([1, 2, 3, "hello"])
+        good = _zlib.compress(raw)
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.load_compressed(self._framed(len(raw), good[:-2]), strict=False)
+
+    def test_rejects_trailing_garbage_after_stream(self):
+        import zlib as _zlib
+        raw = mscs.dumps([1, 2, 3])
+        good = _zlib.compress(raw)
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.load_compressed(self._framed(len(raw), good + b"garbage"),
+                                 strict=False)
+
+    def test_rejects_concatenated_containers(self):
+        # Dos streams zlib concatenados: el segundo queda en unused_data.
+        import zlib as _zlib
+        raw = mscs.dumps([1, 2, 3])
+        blob = struct.pack('<I', len(raw)) + _zlib.compress(raw) + _zlib.compress(raw)
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.load_compressed(io.BytesIO(blob), strict=False)
+
+    def test_truncated_header_2_bytes_clean_error(self):
+        # Antes lanzaba struct.error crudo; ahora MSCDecodeError.
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.load_compressed(io.BytesIO(b'\x01\x02'), strict=False)
+
+    def test_empty_header_clean_error(self):
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.load_compressed(io.BytesIO(b''), strict=False)
+
+    def test_bomb_with_lying_header_still_bounded(self):
+        # Control: el endurecimiento no debe romper el corte anti zip-bomb.
+        import zlib as _zlib
+        bomb = _zlib.compress(b'\x00' * 2_000_000)
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.load_compressed(self._framed(10, bomb), strict=False,
+                                 max_size=100_000)
+
+    def test_compressed_roundtrip_with_hmac(self):
+        # El endurecimiento no interfiere con kwargs (hmac_key) hacia loads().
+        key = b"k" * 32
+        obj = {"secret": [1, 2, 3]}
+        buf = io.BytesIO()
+        mscs.dump_compressed(obj, buf, hmac_key=key)
+        buf.seek(0)
+        assert mscs.load_compressed(buf, strict=False, hmac_key=key) == obj
+
+    @pytest.mark.parametrize("corrupt", ["garbage", "bitflip", "adler"])
+    def test_corrupt_stream_wrapped_not_raw_zlib_error(self, corrupt):
+        # Un stream corrupto (no truncado) debe dar MSCDecodeError, nunca
+        # un zlib.error crudo que el caller no atrapa con except MSCError.
+        import zlib as _zlib
+        raw = mscs.dumps([1, 2, 3, "hello"])
+        good = _zlib.compress(raw)
+        if corrupt == "garbage":
+            body = b'\xDE\xAD\xBE\xEF' * 20
+        elif corrupt == "bitflip":
+            body = bytearray(good); body[len(body) // 2] ^= 0xFF; body = bytes(body)
+        else:  # adler
+            body = bytearray(good); body[-1] ^= 0xFF; body = bytes(body)
+        blob = struct.pack('<I', len(raw)) + body
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.load_compressed(io.BytesIO(blob), strict=False)
+
+    @pytest.mark.parametrize("n,level", [(50_000, 0), (100_000, 6), (200_000, 9)])
+    def test_incompressible_roundtrip_with_tight_max_size(self, n, level):
+        # Datos incompresibles comprimen a MÁS que su tamaño crudo; con
+        # max_size ajustado al tamaño real, el bound de lectura comprimida
+        # (compressBound) no debe rechazar un dump_compressed legítimo.
+        import os as _os, zlib as _zlib
+        obj = _os.urandom(n)
+        raw = mscs.dumps(obj)
+        blob = struct.pack('<I', len(raw)) + _zlib.compress(raw, level)
+        assert len(blob) - 4 > len(raw)  # confirma que comprimido > crudo
+        out = mscs.load_compressed(io.BytesIO(blob), strict=False, max_size=len(raw))
+        assert out == obj
+
+    def test_empty_object_compressed_roundtrip(self):
+        # Casos vacíos/pequeños no deben tropezar con los bounds ajustados.
+        for obj in (None, [], {}, ""):
+            buf = io.BytesIO()
+            mscs.dump_compressed(obj, buf)
+            buf.seek(0)
+            assert mscs.load_compressed(buf, strict=False) == obj
 
 
 class TestReferenceAttacks:
