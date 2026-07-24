@@ -1,0 +1,81 @@
+{
+ "version": 1,
+ "ultima_corrida": "2026-07-23",
+ "modo": "baseline",
+ "commit_ancla": "2d75cc8",
+ "rama": "release/2.5.0",
+ "territorio": {
+  "loc_total": 4215,
+  "sectores": 3,
+  "nivel_rigor": "M1 (criba ligera: barrido Sonnet directo + reevaluacion cruzada ciega + muestreo reducido)"
+ },
+ "sectores": {
+  "src/mscs": {
+   "huella": "9f5acccf5a810543",
+   "estrato": "S3",
+   "ultimo_barrido": "2026-07-23",
+   "checklists": ["CL-SEG", "CL-REC", "CL-LOG", "CL-CONC", "MUESTREO-ESCAPE-decoder"],
+   "resultado": "hallazgos",
+   "abiertos": ["src.CL-SEG.1", "src.ESC.1", "src.CL-SEG.4", "src.CL-REC.2", "src.CL-REC.3", "src.CL-LOG.1"]
+  },
+  "tests": {
+   "huella": "104c09a5f280bbe4",
+   "estrato": "S3-cartografia / tratado-como-codigo-de-test",
+   "ultimo_barrido": "2026-07-23",
+   "checklists": ["CL-LOG", "CL-REC"],
+   "no_aplicados": ["CL-SEG", "CL-CONC"],
+   "resultado": "hallazgos",
+   "abiertos": ["tests.CL-REC.3", "tests.CL-REC.1", "tests.CL-REC.4", "tests.CL-LOG.1", "tests.CL-LOG.2"]
+  },
+  ". (raiz)": {
+   "huella": "c71caa044dd29e4e",
+   "estrato": "S1",
+   "ultimo_barrido": "2026-07-23",
+   "checklists": ["CL-CFG"],
+   "resultado": "limpio-tras-reevaluacion",
+   "abiertos": []
+  }
+ },
+ "metricas": {
+  "hallazgos_E0": 26,
+  "anclas_fallidas_batidores": 0,
+  "fabricacion_batidores": 0.0,
+  "E1_a_E2": 11,
+  "descartados_en_reevaluacion": 16,
+  "precision_barrido": 0.38,
+  "escapes_muestreo": {"src/mscs": 1},
+  "escape_severidad": {"media": 1},
+  "anclas_fallidas_reevaluadores": 0
+ },
+ "escalada": {
+  "peritaje": ["src.CL-SEG.1", "src.ESC.1"],
+  "forja": ["src.CL-SEG.1", "src.ESC.1", "tests.CL-REC.3", "src.CL-LOG.1"]
+ },
+ "peritaje_2026-07-23": {
+  "alcance": "A3 decoder src/mscs/_core.py; 4 peritos + reproductor; informe en _criba/peritaje-decoder-2026-07-23.md",
+  "veredictos_E3": {
+   "src.CL-SEG.1": "CONFIRMADO alta (E3) — rama dataclass no filtra claves; 2 vectores: clobbering/aliasing de __dict__ + invocacion de setter de @property fuera del modelo __setstate__",
+   "src.ESC.1": "CONFIRMADO media (E3) — trailing bytes v1, PoC diferencial + smuggling"
+  },
+  "hallazgos_nuevos": {
+   "PC.1": "ALTA (E3) — conteo de dimensiones del shape NDARRAY/TENSOR sin cap MAX_COLLECTION; DoS amplificacion ~10x memoria medido (22MB input -> 234MB pico; escala real 100MB -> 1.1GB)"
+  },
+  "superficie_limpia_confirmada": ["HMAC/downgrade (33/33)", "resolucion _Pending (todos los caminos)", "zip-bomb/load_compressed", "MAX_SIZE total", "conversiones bytes->int", "ENUM/__setstate__/slots guards"],
+  "recuento": {"critica": 0, "alta": 2, "media": 1, "baja": 1, "informativa": 1},
+  "meta_patron": "5 instancias del defecto 'endurecimiento aplicado a una rama pero no a su gemela': dataclass vs slots, shape vs colecciones, v1 vs v2, + 2 post-mortems historicos (HMAC v1 downgrade, clobbering slots)"
+ },
+ "forja_2026-07-24": {
+  "reparados": {
+   "src.CL-SEG.1": "CERRADO — filtro de claves contra dataclasses.fields (ambos vectores: clobbering __dict__ y setter de @property)",
+   "src.ESC.1": "CERRADO — trailing bytes validados en rama v1 (paridad v2)",
+   "PC.1": "CERRADO — cap de dimensiones (MAX_NDARRAY_DIMS) y de longitud de token (MAX_DIM_DIGITS) compartido NDARRAY/TENSOR"
+  },
+  "hueco_revision_ciega": "6a instancia del meta-patron: el cap de shape contaba dimensiones pero no la longitud del token (int() O(n^2), gemelo de MAX_INT_BYTES) — encontrado por revision doble ciego y reparado en la misma corrida",
+  "tests_ancla_nuevos": 17,
+  "suite": "301 passed (284 base + 17), security_audit 79/79, cero regresiones",
+  "gates": "G0 import + G3 pytest + security_audit + G4 revision doble ciego",
+  "versionado": "sin bump; acumulado en la entrada [2.5.0] del CHANGELOG",
+  "pendientes_fuera_de_alcance": ["tests.CL-REC.3 (falso verde security_audit.py)", "src.CL-LOG.1 (codigo muerto _is_registered)"]
+ },
+ "exclusiones": [".git", ".hypothesis (datos de fuzzing generados)", ".pytest_cache", "__pycache__", "dist (artefactos de build)", ".benchmarks", ".claude", "*.md y LICENSE (documentacion, no codigo)"]
+}

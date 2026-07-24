@@ -2,6 +2,27 @@
 
 All notable changes to MSCS are documented here.
 
+## [2.5.1] — 2026-07-24
+
+Patch release: three decoder branch-parity security findings from the 2026-07-23 audit (criba → peritaje), plus audit-harness hardening and dead-code removal. Wire format unchanged; no API changes. Forged payloads that previously decoded into corrupted or clobbered objects now fail closed with `MSCDecodeError`; legitimate payloads are unaffected.
+
+### Security
+- **Dataclass reconstruction now filters state keys against declared fields (High / data integrity, untrusted input)** — the dataclass branch of the decoder assigned every `state` key via `object.__setattr__(obj, k, v)` without checking it against the class's fields, while the sibling slots branch already routes keys defensively. A forged payload for any registered dataclass could therefore (A) supply a `'__dict__'` key whose dict value *replaces the instance `__dict__` entirely* — clobbering fields, injecting undeclared attributes readable by name, and aliasing identity across objects via a shared ref — and (B) supply a key matching a `@property` name (never a real field), invoking its setter with attacker data, since `object.__setattr__` honors class data descriptors — outside the documented "only `__setstate__` runs on a registered class" model. The branch now precomputes `{f.name for f in dataclasses.fields(cls)}` and fails closed (`MSCDecodeError`) on any key that is not a declared field, matching the slots branch. Non-dict `'__dict__'` values already failed closed. Confirmed with PoC. Anchors: `TestDataclassKeyFiltering` (5 tests), `TestControlParity::test_spurious_dict_key_rejected_in_dataclass_and_slots`.
+- **Bounded ndarray/tensor shape parsing (High / memory + CPU DoS)** — the NDARRAY/TENSOR shape parse `tuple(int(x) for x in shape_str.split('x'))` was the only collection in the format with no size cap. Two amplification vectors: (1) *dimension count* — `split('x')` materialized one substring per dimension, so a `shape_str` of tens of millions of `'x'` (within `MAX_STRING`) forced ~10× memory amplification (measured: 22 MB input → 234 MB peak) before numpy rejected the shape by its own `NPY_MAXDIMS`; (2) *single-token length* — a lone gigantic token with no `'x'` (dimension count 1, passing any count cap) fed `int()` an arbitrarily long string, an O(n²) conversion (CPU DoS) mitigated today only by CPython's mutable, `>=3.11`-only `sys.int_max_str_digits`. Both are now bounded in a shared `_parse_shape()` helper (parity across the NDARRAY and TENSOR branches): the dimension count against `MAX_NDARRAY_DIMS` (64, numpy's limit) via `count('x')` before the split, and each token's length against `MAX_DIM_DIGITS` (20) before `int()` — the same size-bound philosophy `_INT` already applies via `MAX_INT_BYTES`, not relying on interpreter settings. Vector (2) found by independent blind review of the vector-(1) fix. Anchors: `TestNdarrayShapeLimit` (5 tests), `TestTensorShapeLimit` (2 tests).
+- **v1 branch now validates trailing bytes (Medium / parser differential)** — the v1 (legacy) branch of `loads()` returned right after decoding without comparing `buf.tell()` to `len(data)`, while the v2 branch rejects trailing bytes. A v1 payload with appended garbage decoded successfully, silently ignoring the extra bytes, and two concatenated v1 messages decoded only the first (smuggling) — parser-differential fodder for any pipeline that hashes the whole blob but decodes only the object. The v1 branch now applies the same `consumed != len(data)` check as v2 (version parity). v1 has no in-band CRC/HMAC, so the payload ends exactly at `len(data)`. Confirmed with PoC. Anchors: `TestTrailingBytesV1` (3 tests), `TestControlParity::test_trailing_bytes_rejected_in_v1_and_v2`.
+- **Security-audit harness no longer masks unexpected failures (test tooling)** — in `tests/security_audit.py`, `test_note()` caught a bare `except Exception` and recorded *every* failure as an informational NOTE, while `main()` only exits nonzero on BUG/FAIL. A genuine regression in a note-covered check (Path/CRC decode) would therefore pass the audit green (exit 0), hiding the failure. `test_note()` now records only mscs exceptions (the documented, expected behavior for those cases) as notes and escalates any other exception to BUG. Anchors: `TestSecurityAuditHarness` (3 tests).
+
+### Changed
+- Removed dead code: the unused `_is_registered()` helper (no call sites anywhere in the repo).
+
+### Backward Compatibility
+- Wire format unchanged; the encoder is untouched. All valid 2.x / 1.0 payloads still load. The only behavior change is that forged payloads exploiting the three findings above — a spurious dataclass state key, an oversized ndarray/tensor shape, trailing bytes after a v1 payload — now raise `MSCDecodeError` instead of decoding into corrupted/clobbered objects. Legitimate payloads are unaffected.
+
+### Tests
+- Suite grows from 284 to 304: 20 new regression anchors (dataclass key filtering, ndarray/tensor shape bounds, v1 trailing bytes, cross-branch control-parity, and the audit-harness escalation); zero regressions.
+
+---
+
 ## [2.5.0] — 2026-07-14
 
 Minor release: a batch of high/medium data-integrity, DoS, and container-integrity fixes, plus new backward-compatible public API (per-call `max_size` / `max_depth` limits). Wire format unchanged.
