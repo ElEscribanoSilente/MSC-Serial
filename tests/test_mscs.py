@@ -2196,3 +2196,45 @@ class TestControlParity:
 
         with pytest.raises(mscs.MSCDecodeError):
             mscs.loads(_forge_obj(_class_key(ParityDC), {'__dict__': {'evil': 1}}))
+
+
+class TestSecurityAuditHarness:
+    """Ancla: test_note() del script de auditoría no debe tragar una excepción
+    INESPERADA (no-mscs) como NOTA informativa — debe escalar a BUG. Sin esto,
+    una regresión real en un chequeo cubierto por test_note (decode de Path/CRC)
+    haría que security_audit.py pasara con exit 0, ocultando el fallo."""
+
+    @staticmethod
+    def _load_audit():
+        import importlib.util
+        path = os.path.join(os.path.dirname(__file__), 'security_audit.py')
+        spec = importlib.util.spec_from_file_location('_audit_harness', path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_note_escalates_unexpected_exception_to_bug(self):
+        mod = self._load_audit()
+        mod.results.clear()
+
+        def boom():
+            raise ValueError("regresión inesperada")
+
+        mod.test_note("boom", boom, "nota")
+        assert mod.results[-1][0] == 'BUG'
+
+    def test_note_records_mscs_exception_as_note(self):
+        mod = self._load_audit()
+        mod.results.clear()
+
+        def rejected():
+            raise mscs.MSCDecodeError("rechazo esperado")
+
+        mod.test_note("rejected", rejected, "nota")
+        assert mod.results[-1][0] == 'NOTE'
+
+    def test_note_records_success_as_note(self):
+        mod = self._load_audit()
+        mod.results.clear()
+        mod.test_note("ok", lambda: 42, "nota")
+        assert mod.results[-1][0] == 'NOTE'

@@ -41,12 +41,19 @@ def test_ok(name, fn):
         results.append(('BUG', name, f'{type(e).__name__}: {e}'))
 
 def test_note(name, fn, note):
-    """Run fn, always OK, but record a note (informational)."""
+    """Run fn and record an informational note. mscs exceptions
+    (MSCDecodeError/MSCSecurityError/MSCEncodeError) are the expected,
+    documented behavior for these cases and are recorded as the note; any
+    OTHER exception is an unexpected bug and escalates to BUG (nonzero exit)
+    instead of being silently absorbed into an informational note — otherwise
+    a real regression in a note-covered check would pass the audit green."""
     try:
         result = fn()
         results.append(('NOTE', name, f'{note}: {result!r}'))
-    except Exception as e:
+    except (mscs.MSCDecodeError, mscs.MSCSecurityError, mscs.MSCEncodeError) as e:
         results.append(('NOTE', name, f'{note}: {type(e).__name__}: {e}'))
+    except Exception as e:
+        results.append(('BUG', name, f'UNEXPECTED {type(e).__name__}: {e}'))
 
 HEADER = MAGIC + VERSION + b'\x00'
 

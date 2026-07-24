@@ -446,10 +446,6 @@ def _collect_slot_names(cls: Type) -> tuple:
     return tuple(names)
 
 
-def _is_registered(class_path: str) -> bool:
-    return class_path in _registry
-
-
 def _get_registered(class_path: str) -> Type:
     if class_path not in _registry:
         raise MSCSecurityError(

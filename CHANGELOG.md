@@ -2,9 +2,9 @@
 
 All notable changes to MSCS are documented here.
 
-## [2.5.0] — 2026-07-14
+## [2.5.0] — 2026-07-24
 
-Minor release: a batch of high/medium data-integrity, DoS, and container-integrity fixes, plus new backward-compatible public API (per-call `max_size` / `max_depth` limits). Wire format unchanged.
+Minor release: a batch of high/medium data-integrity, DoS, and container-integrity fixes, plus new backward-compatible public API (per-call `max_size` / `max_depth` limits). Wire format unchanged. Includes the three decoder branch-parity findings from the 2026-07-23 audit (criba → peritaje) and the audit-harness hardening below.
 
 ### Fixed
 - **Silent loss of `__slots__` attributes (High / data integrity)** — the encoder's slot extraction missed three shapes, all round-tripping without error but returning incomplete instances: (1) `__slots__ = "name"` declared as a plain string was iterated character by character, serializing an empty state; (2) hybrid classes (a `__slots__` base with a `__dict__` subclass) took the `__dict__` branch and dropped every inherited slot — and the decoder wrote slot values into `obj.__dict__`, where the slot descriptor shadows them; (3) private slots (`__name`) were looked up unmangled, missing the real `_Class__name` attribute. Slot names are now collected once per class via `_collect_slot_names()`: full MRO walk using each class's own `__slots__` (str/iterable/dict forms), CPython name-mangling applied, `__dict__`/`__weakref__` entries excluded; the encoder merges slots with instance `__dict__` for hybrids (effective values win over shadowed dict keys), and the decoder routes each state key to its store — slot names through their descriptor (`setattr`), everything else directly into the instance `__dict__`. Routing per store matters: blanket `setattr` would let a spurious-but-legal `"__dict__"` key inside an instance dict *replace the object's entire `__dict__`* (silent attribute clobbering and cross-object identity aliasing — caught by independent blind review of this fix). On slots-only classes a non-slot key fails closed (`AttributeError` → `MSCDecodeError`). Unset slots stay unset after round-trip. Anchors: `TestSlotsRoundtrip` (13 tests).
@@ -25,8 +25,11 @@ Minor release: a batch of high/medium data-integrity, DoS, and container-integri
 
 - **v1 branch now validates trailing bytes (Medium / parser differential)** — the v1 (legacy) branch of `loads()` returned right after decoding without comparing `buf.tell()` to `len(data)`, while the v2 branch rejects trailing bytes. A v1 payload with appended garbage decoded successfully, silently ignoring the extra bytes, and two concatenated v1 messages decoded only the first (smuggling) — parser-differential fodder for any pipeline that hashes the whole blob but decodes only the object. The v1 branch now applies the same `consumed != len(data)` check as v2 (version parity). v1 has no in-band CRC/HMAC, so the payload ends exactly at `len(data)`. Confirmed with PoC (peritaje 2026-07-23). Anchors: `TestTrailingBytesV1` (3 tests), `TestControlParity::test_trailing_bytes_rejected_in_v1_and_v2`.
 
+- **Security-audit harness no longer masks unexpected failures (test tooling)** — in `tests/security_audit.py`, `test_note()` caught a bare `except Exception` and recorded *every* failure as an informational NOTE, while `main()` only exits nonzero on BUG/FAIL. A genuine regression in a note-covered check (Path/CRC decode) would therefore pass the audit green (exit 0), hiding the failure. `test_note()` now records only mscs exceptions (the documented, expected behavior for those cases) as notes and escalates any other exception to BUG. Anchors: `TestSecurityAuditHarness` (3 tests).
+
 ### Changed
 - One legitimate-but-unresolvable shape now fails closed instead of corrupting: a class with a custom `__setstate__` whose state contains a reference to a tuple still under construction (a cycle through a tuple into an opaque `__setstate__`) raises `MSCDecodeError` with guidance, where it previously received `None` silently. Break the cycle through a mutable container, or drop `__setstate__`. Anchor: `test_setstate_object_in_tuple_cycle_fails_closed`.
+- Removed dead code: the unused `_is_registered()` helper (no call sites anywhere in the repo).
 
 ### Performance
 - The per-item pending checks cost ~11% on a container-dense synthetic microbenchmark (2000-key dict of small lists/tuples). On buffer-dominated payloads (tensors, arrays, long strings) the overhead is proportional to container count, not data size, and is noise.
@@ -36,7 +39,7 @@ Minor release: a batch of high/medium data-integrity, DoS, and container-integri
 - New keyword-only parameters (`max_size`, `max_depth`) are additive with backward-compatible defaults. One behavior change: `loads()`/`load()` now reject a blob larger than `max_size` (default 512 MB). A payload that legitimately serializes above 512 MB — rare — must be loaded with an explicit higher `max_size`.
 
 ### Tests
-- Suite grows from 215 to 301: 66 anchors for the data-integrity/DoS/container fixes above, then 17 more for the peritaje 2026-07-23 findings (dataclass key filtering, ndarray/tensor shape bounds, v1 trailing bytes, and the cross-branch control-parity tests); zero regressions.
+- Suite grows from 215 to 304: 66 anchors for the data-integrity/DoS/container fixes above, then 20 more for the 2026-07-23 audit (dataclass key filtering, ndarray/tensor shape bounds, v1 trailing bytes, cross-branch control-parity, and the audit-harness escalation); zero regressions.
 
 ---
 
