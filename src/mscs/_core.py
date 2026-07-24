@@ -209,7 +209,7 @@ try:
 except ImportError:
     _torch = None
 
-__version__ = "2.5.0"
+__version__ = "2.5.1"
 __all__ = [
     "dump", "load", "dumps", "loads",
     "dump_compressed", "load_compressed",
