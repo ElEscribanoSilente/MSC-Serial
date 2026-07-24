@@ -1960,3 +1960,239 @@ class TestDequeSecurity:
         payload = self._craft_deque_payload(-1, 5)
         with pytest.raises(mscs.MSCDecodeError):
             mscs.loads(payload, strict=False)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PERITAJE 2026-07-23 — anclas de regresión
+# ═══════════════════════════════════════════════════════════════════
+
+def _forge_obj(cls_path: str, state: dict) -> bytes:
+    """Forja un blob v2 con un único OBJ(cls_path, state). El `state` es lo que
+    un atacante controla: un dict serializado con el encoder real (sin refs
+    internas, así que la numeración de refs del OBJ es irrelevante aquí)."""
+    buf = io.BytesIO()
+    buf.write(MAGIC + VERSION + b'\x00')
+    enc = mscs._core._Encoder(buf)
+    enc.buf.write(_OBJ)
+    enc._encode_str(cls_path)
+    enc.encode(state)
+    return buf.getvalue()
+
+
+class TestDataclassKeyFiltering:
+    """Ancla del hallazgo ALTA: la rama dataclass del decoder no filtraba las
+    claves del state contra dataclasses.fields(cls), permitiendo clobbering de
+    __dict__ e invocación de setters de @property con datos del atacante.
+    Gemelo del fix de slots (ver TestSlotsRoundtrip)."""
+
+    def test_dataclass_roundtrip_still_works(self):
+        @mscs.register
+        @dataclasses.dataclass
+        class DCOk:
+            x: int = 0
+            y: int = 0
+
+        result = mscs.loads(mscs.dumps(DCOk(1, 2)))
+        assert result.x == 1 and result.y == 2
+
+    def test_forged_dict_key_on_dataclass_fails_closed(self):
+        # Clave espuria '__dict__' -> reemplazo del dict de instancia entero.
+        @mscs.register
+        @dataclasses.dataclass
+        class DCClob:
+            x: int = 0
+            y: int = 0
+
+        blob = _forge_obj(_class_key(DCClob),
+                          {'__dict__': {'is_admin': True, 'injected': 'x'}})
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(blob)
+
+    def test_forged_property_key_on_dataclass_fails_closed(self):
+        # Clave que coincide con una @property (no field) -> invocaría su setter
+        # fuera del modelo documentado ("solo __setstate__ se ejecuta").
+        side = []
+
+        @mscs.register
+        @dataclasses.dataclass
+        class DCProp:
+            _v: bool = False
+
+            @property
+            def admin(self):
+                return self._v
+
+            @admin.setter
+            def admin(self, value):
+                side.append(value)
+                object.__setattr__(self, '_v', value)
+
+        blob = _forge_obj(_class_key(DCProp), {'admin': True})
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(blob)
+        assert side == []  # el setter jamás se invocó
+
+    def test_forged_nonfield_key_on_dataclass_fails_closed(self):
+        # Cualquier clave que no sea un field declarado se rechaza (fail-closed).
+        @mscs.register
+        @dataclasses.dataclass
+        class DCExtra:
+            x: int = 0
+
+        blob = _forge_obj(_class_key(DCExtra), {'x': 1, 'surprise': 999})
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(blob)
+
+    def test_frozen_dataclass_roundtrip_still_works(self):
+        # El fix no debe romper el round-trip de frozen (object.__setattr__).
+        @mscs.register
+        @dataclasses.dataclass(frozen=True)
+        class DCFrozen:
+            a: int = 0
+            b: str = ""
+
+        result = mscs.loads(mscs.dumps(DCFrozen(7, "ok")))
+        assert result.a == 7 and result.b == "ok"
+
+
+@pytest.mark.skipif(not HAS_NUMPY, reason="numpy not installed")
+class TestNdarrayShapeLimit:
+    """Ancla del hallazgo ALTA: el conteo de dimensiones del shape no pasaba por
+    el cap MAX_COLLECTION/MAX_NDARRAY_DIMS -> DoS de amplificación de memoria
+    (el .split('x') materializaba millones de substrings antes de que numpy
+    rechazara). El cap corta O(1) sin materializar."""
+
+    def _forge_ndarray(self, meta: str, raw: bytes = b'\x00') -> bytes:
+        buf = io.BytesIO()
+        buf.write(MAGIC + VERSION + b'\x00')
+        enc = mscs._core._Encoder(buf)
+        enc.buf.write(_NDARRAY)
+        enc._encode_str(meta)
+        enc.buf.write(struct.pack('<I', len(raw)))
+        enc.buf.write(raw)
+        return buf.getvalue()
+
+    def test_excessive_shape_dimensions_rejected(self):
+        # 100 dimensiones (> el cap): rechazo por el guard propio, con su
+        # mensaje distintivo — NO por el error de numpy (que llegaría después
+        # de materializar el split).
+        meta = "uint8|" + "x".join(["1"] * 100)
+        blob = self._forge_ndarray(meta)
+        with pytest.raises(mscs.MSCDecodeError, match="dimensiones"):
+            mscs.loads(blob)
+
+    def test_huge_shape_dimensions_rejected(self):
+        # 5M dimensiones: antes materializaba ~250MB de substrings; ahora se
+        # corta antes del split. Solo verifica el rechazo (sin medir memoria).
+        meta = "uint8|" + "x".join(["1"] * 5_000_000)
+        blob = self._forge_ndarray(meta)
+        with pytest.raises(mscs.MSCDecodeError, match="dimensiones"):
+            mscs.loads(blob)
+
+    def test_huge_single_dimension_token_rejected(self):
+        # Gemelo del cap de dimensiones: UN solo token gigante (cero 'x' ->
+        # ndim=1, pasa el cap de conteo) fuerza int() O(n^2) sobre el token —
+        # DoS de CPU. La longitud del token se acota antes de int(), sin
+        # depender de sys.int_max_str_digits (mutable global, ausente en
+        # Python <3.11). Desactivamos esa mitigación del intérprete para
+        # probar el cap de mscs, no el de CPython.
+        old = sys.get_int_max_str_digits()
+        try:
+            sys.set_int_max_str_digits(0)
+            meta = "uint8|" + "9" * 10000
+            blob = self._forge_ndarray(meta)
+            with pytest.raises(mscs.MSCDecodeError, match="d[íi]gitos"):
+                mscs.loads(blob)
+        finally:
+            sys.set_int_max_str_digits(old)
+
+    def test_normal_ndarray_still_works(self):
+        arr = np.arange(24, dtype='float32').reshape(2, 3, 4)
+        result = mscs.loads(mscs.dumps(arr))
+        assert result.shape == (2, 3, 4)
+        assert np.array_equal(result, arr)
+
+    def test_moderate_multidim_ndarray_still_works(self):
+        # Un array con varias dimensiones (bajo el cap) hace round-trip.
+        arr = np.zeros((1,) * 16, dtype='uint8')
+        result = mscs.loads(mscs.dumps(arr))
+        assert result.shape == (1,) * 16
+
+
+@pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
+class TestTensorShapeLimit:
+    """Gemelo de TestNdarrayShapeLimit para el tag _TENSOR."""
+
+    def _forge_tensor(self, meta: str, raw: bytes = b'\x00') -> bytes:
+        buf = io.BytesIO()
+        buf.write(MAGIC + VERSION + b'\x00')
+        enc = mscs._core._Encoder(buf)
+        enc.buf.write(_TENSOR)
+        enc._encode_str(meta)
+        enc.buf.write(struct.pack('<I', len(raw)))
+        enc.buf.write(raw)
+        return buf.getvalue()
+
+    def test_excessive_tensor_shape_dimensions_rejected(self):
+        meta = "float32|" + "x".join(["1"] * 100)
+        blob = self._forge_tensor(meta)
+        with pytest.raises(mscs.MSCDecodeError, match="dimensiones"):
+            mscs.loads(blob)
+
+    def test_normal_tensor_still_works(self):
+        t = torch.zeros(2, 3, 4)
+        result = mscs.loads(mscs.dumps(t))
+        assert tuple(result.shape) == (2, 3, 4)
+
+
+class TestTrailingBytesV1:
+    """Ancla del hallazgo MEDIA: la rama v1 de loads() no validaba trailing
+    bytes (la v2 sí). Gemelo de TestTrailingBytes para el formato v1."""
+
+    def _v1_int(self, value: int = 42) -> bytes:
+        return b'MSCS\x01' + _INT + struct.pack('<H', 1) + bytes([value])
+
+    def test_v1_trailing_bytes_rejected(self):
+        with pytest.raises(mscs.MSCDecodeError, match="[Tt]railing"):
+            mscs.loads(self._v1_int() + b'\xde\xad', strict=False)
+
+    def test_v1_smuggling_rejected(self):
+        # Dos mensajes v1 concatenados: el segundo no debe pasar como basura.
+        with pytest.raises(mscs.MSCDecodeError, match="[Tt]railing"):
+            mscs.loads(self._v1_int(1) + self._v1_int(2), strict=False)
+
+    def test_v1_clean_still_works(self):
+        assert mscs.loads(self._v1_int(42), strict=False) == 42
+
+
+class TestControlParity:
+    """Meta-patrón del proyecto: un control aplicado a una rama pero no a su
+    gemela. Estos tests fijan que los controles clave se aplican en TODAS las
+    ramas paralelas, no solo en la que disparó el bug histórico."""
+
+    def test_trailing_bytes_rejected_in_v1_and_v2(self):
+        # v2
+        with pytest.raises(mscs.MSCDecodeError, match="[Tt]railing"):
+            mscs.loads(mscs.dumps(42) + b'\x00', strict=False)
+        # v1
+        v1 = b'MSCS\x01' + _INT + struct.pack('<H', 1) + b'\x2a'
+        with pytest.raises(mscs.MSCDecodeError, match="[Tt]railing"):
+            mscs.loads(v1 + b'\x00', strict=False)
+
+    def test_spurious_dict_key_rejected_in_dataclass_and_slots(self):
+        # slots puros (rama ya endurecida en 2026-07-13)
+        @mscs.register
+        class ParitySlots:
+            __slots__ = ('a',)
+
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(_forge_obj(_class_key(ParitySlots), {'__dict__': {'evil': 1}}))
+
+        # dataclass (rama gemela endurecida en 2026-07-23)
+        @mscs.register
+        @dataclasses.dataclass
+        class ParityDC:
+            a: int = 0
+
+        with pytest.raises(mscs.MSCDecodeError):
+            mscs.loads(_forge_obj(_class_key(ParityDC), {'__dict__': {'evil': 1}}))

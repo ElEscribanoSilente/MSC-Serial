@@ -284,6 +284,14 @@ MAX_COMPRESSED  = 512 * 1024 * 1024  # 512 MB (compressed input limit, anti zip-
 MAX_COLLECTION  = 10_000_000
 MAX_STRING      = 100 * 1024 * 1024  # 100 MB
 MAX_INT_BYTES   = 8192              # ~19,700 dígitos decimales
+MAX_NDARRAY_DIMS = 64              # límite de numpy (NPY_MAXDIMS); un shape con
+                                   # más dimensiones se rechaza SIN materializar
+                                   # el split (anti-DoS de amplificación)
+MAX_DIM_DIGITS  = 20               # una dimensión real cabe en un int64 (≤19
+                                   # dígitos); acota la longitud de cada token
+                                   # antes de int() — sin esto un solo token
+                                   # gigante fuerza int() O(n²) (DoS de CPU),
+                                   # sin depender de sys.int_max_str_digits
 
 _HMAC_DIGEST_SIZE = 32  # SHA-256
 
@@ -852,6 +860,35 @@ class _Decoder:
             )
         return n
 
+    def _parse_shape(self, shape_str: str) -> tuple:
+        """Parsea 'AxBxC' a tuple de ints con dos cotas, ambas ANTES de la
+        conversión cara: (1) el NÚMERO de dimensiones (`count('x')`, O(n) en C
+        sin crear objetos) — sin él un shape_str de millones de 'x' dentro de
+        MAX_STRING materializaría millones de substrings (DoS de memoria); y
+        (2) la LONGITUD de cada token antes de int() — sin ella un único token
+        gigante (ndim=1, que pasa la cota anterior) fuerza una conversión
+        int() O(n²) (DoS de CPU), y no dependemos de sys.int_max_str_digits
+        (global mutable, ausente en Python <3.11). Es la misma cota de tamaño
+        que _INT ya aplica con MAX_INT_BYTES. Aplicado por igual a _NDARRAY y
+        _TENSOR (paridad entre ramas gemelas)."""
+        if not shape_str:
+            return ()
+        ndim = shape_str.count('x') + 1
+        if ndim > MAX_NDARRAY_DIMS:
+            raise MSCDecodeError(
+                f"shape excede el número máximo de dimensiones: "
+                f"{ndim:,} > {MAX_NDARRAY_DIMS} en {self._path_str()}"
+            )
+        dims = []
+        for tok in shape_str.split('x'):
+            if len(tok) > MAX_DIM_DIGITS:
+                raise MSCDecodeError(
+                    f"dimensión de shape con demasiados dígitos: "
+                    f"{len(tok):,} > {MAX_DIM_DIGITS} en {self._path_str()}"
+                )
+            dims.append(int(tok))
+        return tuple(dims)
+
     def _store_ref(self, obj: Any) -> Any:
         self.refs[len(self.refs)] = obj
         return obj
@@ -1159,7 +1196,7 @@ class _Decoder:
                 raise MSCSecurityError(
                     f"numpy dtype no permitido en deserialización: {dtype_str!r}"
                 )
-            shape = tuple(int(x) for x in shape_str.split('x')) if shape_str else ()
+            shape = self._parse_shape(shape_str)
             n = self._read_length(MAX_SIZE)
             raw = self._read(n)
             arr = _np.frombuffer(raw, dtype=_np.dtype(dtype_str)).copy().reshape(shape)
@@ -1176,7 +1213,7 @@ class _Decoder:
                 raise MSCSecurityError(
                     f"tensor dtype no permitido: {dtype_str!r}"
                 )
-            shape = tuple(int(x) for x in shape_str.split('x')) if shape_str else ()
+            shape = self._parse_shape(shape_str)
             n = self._read_length(MAX_SIZE)
             raw = self._read(n)
             arr = _np.frombuffer(raw, dtype=_np.dtype(dtype_str)).copy().reshape(shape)
@@ -1276,7 +1313,20 @@ class _Decoder:
                 # Un valor pendiente NUNCA se asigna: la primera (y única)
                 # asignación la hace el fix-up con el valor real, para que
                 # descriptors/__setattr__ de usuario jamás vean el sentinela.
+                # Las claves se filtran contra los fields declarados (fail-
+                # closed): una clave espuria del payload no es un field, y sin
+                # este filtro '__dict__' reemplazaría el dict de instancia
+                # entero (clobbering/aliasing) y el nombre de una @property
+                # invocaría su setter con datos del atacante — fuera del modelo
+                # "solo __setstate__ se ejecuta". Paridad con la rama slots.
+                field_names = {f.name for f in dataclasses.fields(cls)}
                 for k, v in state.items():
+                    if k not in field_names:
+                        raise MSCDecodeError(
+                            f"Clave '{k}' no es un field de la dataclass "
+                            f"{class_path} en {self._path_str()} — payload "
+                            f"manipulado"
+                        )
                     if type(v) is _Pending:
                         self._defer(v, lambda val, o=obj, key=k: object.__setattr__(o, key, val))
                     else:
@@ -1426,7 +1476,17 @@ def loads(data: bytes, *, strict: bool = True,
         # Respeta el strict del llamante: forzar strict=False sería otro
         # downgrade silencioso de la política de seguridad solicitada.
         dec = _Decoder(buf, strict=strict, max_depth=max_depth)
-        return dec.assert_fully_resolved(dec.decode())
+        result = dec.assert_fully_resolved(dec.decode())
+        # Trailing bytes: mismo control que la rama v2 (paridad de versión).
+        # v1 no tiene CRC/HMAC in-band, así que el payload real acaba en
+        # len(data); cualquier byte de más es corrupción o smuggling.
+        if buf.tell() != len(data):
+            raise MSCDecodeError(
+                f"Trailing bytes: se consumieron {buf.tell()} de "
+                f"{len(data)} bytes. Payload posiblemente corrupto o "
+                f"manipulado."
+            )
+        return result
 
     if ver != VERSION:
         raise MSCDecodeError(f"Versión no soportada: {ver!r}")
