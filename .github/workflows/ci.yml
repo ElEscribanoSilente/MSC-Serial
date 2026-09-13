@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Base / ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e ".[test]"
+      - run: python -m pytest -q
+      - run: python tests/security_audit.py
+        env:
+          PYTHONPATH: src
+          PYTHONIOENCODING: utf-8
+
+  optional:
+    name: Arrays and tensors / ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.9", "3.14"]
+        include:
+          - python: "3.9"
+            numpy: numpy==1.20.0
+            torch: torch==2.8.0
+          - python: "3.14"
+            numpy: numpy
+            torch: torch
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install CPU tensor dependencies
+        env:
+          NUMPY_SPEC: ${{ matrix.numpy }}
+          TORCH_SPEC: ${{ matrix.torch }}
+        shell: bash
+        run: |
+          python -m pip install "$NUMPY_SPEC"
+          python -m pip install "$TORCH_SPEC" --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[all,test]"
+      - run: python -m pytest -q
+      - run: python tests/security_audit.py
+        env:
+          PYTHONPATH: src
+          PYTHONIOENCODING: utf-8
+
+  distributions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+      - run: python -m pip install build twine
+      - run: python scripts/check_release.py
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+      - run: python -m build
+      - run: python -m twine check --strict dist/*.whl dist/*.tar.gz
+      - run: python scripts/check_release.py --dist dist
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: release-distributions
+          path: dist/
+          if-no-files-found: error
+
+  installed:
+    name: Installed wheel / ${{ matrix.os }} / Python ${{ matrix.python }}
+    needs: distributions
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.9", "3.14"]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-distributions
+          path: dist/
+      - name: Install wheel and check outside source import path
+        shell: bash
+        run: |
+          python -m pip install dist/*.whl
+          python -I scripts/smoke_installed.py
+      - name: Build and install sdist on minimum Python
+        if: matrix.python == '3.9'
+        shell: bash
+        run: |
+          python -m pip install --force-reinstall dist/*.tar.gz
+          python -I scripts/smoke_installed.py

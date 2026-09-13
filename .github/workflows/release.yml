@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: validate
+    if: >-
+      github.event_name == 'release' &&
+      !github.event.release.prerelease &&
+      github.repository == 'ElEscribanoSilente/MSC-Serial'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mscs
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-distributions
+          path: artifacts/
+      - name: Verify hashes and select only uploadable packages
+        shell: bash
+        run: |
+          cd artifacts
+          sha256sum --check SHA256SUMS
+          mkdir ../dist
+          cp -- *.whl *.tar.gz ../dist/
+      - name: Publish validated packages to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist/
+
+  github-assets:
+    needs: [validate, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-distributions
+          path: dist/
+      - name: Verify and attach the published artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        shell: bash
+        run: |
+          cd dist
+          sha256sum --check SHA256SUMS
+          gh release upload "$RELEASE_TAG" -- *.whl *.tar.gz SHA256SUMS
