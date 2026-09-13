@@ -2,6 +2,50 @@
 
 All notable changes to MSCS are documented here.
 
+## [2.6.0] — 2026-09-13
+
+### Fixed
+- Prevent invalid Enum values from expanding shared graphs into large builtin
+  error messages. Resolve registered members and `_missing_` directly, preserving
+  value aliases and Flag behavior across supported Python versions.
+- Bound recursive builtin hashing during decoding with a cumulative
+  `max_hash_work` budget (default 1,000,000), including shared-reference graphs,
+  collection items, Enum values and deferred dict insertions. Dict error paths
+  no longer call `repr()` on keys. Deep hash reference chains also obey `max_depth`.
+- Preserve primitive-backed Enum types and registered Enum identity in
+  `strict=False` and `copy()`, retaining the non-Enum registry guard.
+- Preserve inherited, private and unset dataclass slots, including cycles and
+  frozen slotted dataclasses. Retain custom state hooks and declared-key checks.
+- Preserve bfloat16 tensor bits with explicit little-endian 16-bit storage,
+  and resolve conjugate/negative views before NumPy conversion.
+- Require PyTorch >=2.8 in the `torch` and `all` extras to exclude the audited
+  torch 2.0 / NumPy 2 ABI incompatibility. NumPy >=1.20 remains supported.
+
+### Compatibility
+- `loads`, `load` and `load_compressed` accept `max_hash_work`. Large legitimate
+  hashed structures may exceed the new default and need an explicit budget.
+- Existing field-only list states for frozen slotted dataclasses still load
+  and remain the writer's format when there is no populated non-field slot.
+  New field-and-slot dict states require updated readers. New bfloat16
+  metadata is additive within wire v2 and is rejected by older readers.
+- Primitive enums previously encoded as plain scalars cannot regain their
+  original class when loading those old files.
+- Custom Enum metaclass `__call__` is no longer invoked by decoding. Registered
+  `_missing_` hooks remain a trusted extension point and may execute user code.
+
+### Release tooling
+- Document authentication, registry trust, resource limits and migration behavior.
+- Add Python 3.14 coverage, public security regression tests, clean wheel/sdist
+  validation, installed-package smoke checks and GitHub Actions workflows.
+- Exclude local audit/agent state, caches and credentials from new Git additions.
+  Source distributions include tests, changelog, security policy and release guide.
+
+### Tests
+- 408 collected regression and property cases (104 added since 2.5.1), with
+  feature-dependent skips on older interpreters or without optional packages.
+- Local Windows validation covers Python 3.9–3.14, including NumPy 1.20.0 /
+  PyTorch 2.8.0 minimum dependencies and installed wheel/sdist smoke checks.
+
 ## [2.5.1] — 2026-07-24
 
 Patch release: three decoder branch-parity security findings from the 2026-07-23 audit (criba → peritaje), plus audit-harness hardening and dead-code removal. Wire format unchanged; no API changes. Forged payloads that previously decoded into corrupted or clobbered objects now fail closed with `MSCDecodeError`; legitimate payloads are unaffected.

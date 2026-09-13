@@ -1,5 +1,5 @@
 """
-MSC Serial v2.5
+MSC Serial v2.6
 ===============
 Reemplazo personal y seguro de pickle.
 
@@ -189,6 +189,7 @@ import hashlib
 import threading
 import inspect as _inspect_mod
 import dataclasses
+import enum as _enum
 from collections import deque
 from datetime import datetime, date, time, timedelta
 from decimal import Decimal
@@ -209,14 +210,14 @@ try:
 except ImportError:
     _torch = None
 
-__version__ = "2.5.1"
+__version__ = "2.6.0"
 __all__ = [
     "dump", "load", "dumps", "loads",
     "dump_compressed", "load_compressed",
     "register", "register_alias", "register_module",
     "inspect", "benchmark", "copy",
     "MSCError", "MSCEncodeError", "MSCDecodeError", "MSCSecurityError",
-    "MAX_INT_BYTES",
+    "MAX_INT_BYTES", "MAX_HASH_WORK",
 ]
 
 # ─────────────────────── EXCEPTIONS ───────────────────────────────
@@ -284,6 +285,7 @@ MAX_COMPRESSED  = 512 * 1024 * 1024  # 512 MB (compressed input limit, anti zip-
 MAX_COLLECTION  = 10_000_000
 MAX_STRING      = 100 * 1024 * 1024  # 100 MB
 MAX_INT_BYTES   = 8192              # ~19,700 dígitos decimales
+MAX_HASH_WORK   = 1_000_000         # coste acumulado de hash de claves/items
 MAX_NDARRAY_DIMS = 64              # límite de numpy (NPY_MAXDIMS); un shape con
                                    # más dimensiones se rechaza SIN materializar
                                    # el split (anti-DoS de amplificación)
@@ -455,6 +457,15 @@ def _get_registered(class_path: str) -> Type:
     return _registry[class_path]
 
 
+def _generated_dataclass_state(cls: Type) -> bool:
+    """Distingue los hooks field-only generados de los hooks del usuario."""
+    getstate = getattr(dataclasses, '_dataclass_getstate', None)
+    setstate = getattr(dataclasses, '_dataclass_setstate', None)
+    return (getstate is not None and setstate is not None
+            and getattr(cls, '__getstate__', None) is getstate
+            and getattr(cls, '__setstate__', None) is setstate)
+
+
 # ──────────────────────── ENCODER ─────────────────────────────────
 
 class _Encoder:
@@ -516,6 +527,13 @@ class _Encoder:
         if isinstance(obj, bool):  # antes de int
             buf.write(_BOOL)
             buf.write(b'\x01' if obj else b'\x00')
+            return
+
+        # Enum precede a sus posibles mixins primitivos (IntEnum, str, float).
+        if isinstance(obj, Enum):
+            buf.write(_ENUM)
+            self._encode_str(_class_key(type(obj)))
+            self.encode(obj.value)
             return
 
         if isinstance(obj, int):
@@ -624,15 +642,6 @@ class _Encoder:
             buf.write(raw)
             return
 
-        # ── Enum ──
-
-        if isinstance(obj, Enum):
-            buf.write(_ENUM)
-            cls_path = _class_key(type(obj))
-            self._encode_str(cls_path)
-            self.encode(obj.value)
-            return
-
         # ── Colecciones (con ref tracking) ──
 
         if isinstance(obj, deque):
@@ -719,10 +728,16 @@ class _Encoder:
         if _torch is not None and isinstance(obj, _torch.Tensor):
             if self._assign_ref(obj):
                 return
-            t = obj.detach().cpu().contiguous()
-            arr = t.numpy()
-            dtype_s = str(arr.dtype)
-            if not _is_safe_dtype(dtype_s):
+            t = obj.detach().cpu().resolve_conj().resolve_neg().contiguous()
+            if t.dtype == _torch.bfloat16:
+                # NumPy no tiene bfloat16 nativo: transportar los bits, sin
+                # conversión a float32 ni pérdida de payloads NaN. Wire: LE16.
+                arr = t.view(_torch.int16).numpy().astype(_np.dtype('<i2'), copy=False)
+                dtype_s = 'bfloat16'
+            else:
+                arr = t.numpy()
+                dtype_s = str(arr.dtype)
+            if dtype_s != 'bfloat16' and not _is_safe_dtype(dtype_s):
                 raise MSCEncodeError(
                     f"torch dtype no permitido: {obj.dtype} (numpy: {dtype_s!r})"
                 )
@@ -745,13 +760,22 @@ class _Encoder:
         cls_path = _class_key(type(obj))
         self._encode_str(cls_path)
 
-        if '__getstate__' in type(obj).__dict__ or any(
+        generated_state = _generated_dataclass_state(type(obj))
+        if not generated_state and any(
             '__getstate__' in c.__dict__ for c in type(obj).__mro__[:-1]
             if c is not object
         ):
             state = obj.__getstate__()
         elif dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-            state = {f.name: getattr(obj, f.name) for f in dataclasses.fields(obj)}
+            fields = dataclasses.fields(obj)
+            state = {f.name: getattr(obj, f.name) for f in fields}
+            for s in _collect_slot_names(type(obj)):
+                if hasattr(obj, s):
+                    state[s] = getattr(obj, s)
+            if generated_state and len(state) == len(fields):
+                # Sin estado adicional, conservar el wire field-only que
+                # entienden los lectores anteriores para frozen+slots.
+                state = [state[f.name] for f in fields]
         else:
             slot_names = _collect_slot_names(type(obj))
             if slot_names:
@@ -806,10 +830,11 @@ class _Pending:
 
 class _Decoder:
     __slots__ = ('buf', 'depth', 'refs', 'strict', 'path', '_fixups',
-                 '_open_windows', 'max_depth')
+                 '_open_windows', 'max_depth', '_hash_remaining', '_hash_costs')
 
     def __init__(self, buf: io.BytesIO, *, strict: bool = True,
-                 max_depth: Optional[int] = None):
+                 max_depth: Optional[int] = None,
+                 max_hash_work: Optional[int] = None):
         self.buf = buf
         self.depth = 0
         self.refs: Dict[int, Any] = {}
@@ -818,6 +843,109 @@ class _Decoder:
         self._fixups: Dict[int, List] = {}  # ref_id pendiente -> [callable(valor)]
         self._open_windows = 0              # slots _PENDING_SLOT vivos en refs
         self.max_depth = MAX_DEPTH if max_depth is None else max_depth
+        self._hash_remaining = MAX_HASH_WORK if max_hash_work is None else max_hash_work
+        if type(self._hash_remaining) is not int or self._hash_remaining < 0:
+            raise ValueError('max_hash_work debe ser un entero no negativo')
+        # id -> (objeto retenido, coste expandido, altura). No se hashea el
+        # objeto al inspeccionarlo; el coste suma cada REF aunque el recorrido
+        # memorice cada contenedor una sola vez.
+        self._hash_costs: Dict[int, tuple] = {}
+
+    def _check_hash_work(self, obj: Any) -> None:
+        """Acota hash recursivo de builtins antes de entrar en código nativo.
+
+        No acota __hash__/__eq__ de clases registradas ni las colisiones.
+        El recorrido iterativo también detecta cadenas profundas vía REF,
+        cuya profundidad semántica no limita el parser del blob.
+        """
+        remaining = self._hash_remaining
+
+        def check(cost, height):
+            if cost > remaining or height > self.max_depth:
+                raise MSCDecodeError(
+                    f'Límite de hash excedido en {self._path_str()} '
+                    f'(max_hash_work restante: {remaining}, max_depth: {self.max_depth})'
+                )
+
+        def known(value):
+            if type(value) not in (tuple, frozenset):
+                return (value, 1, 0)
+            return self._hash_costs.get(id(value))
+
+        metric = known(obj)
+        if metric is None:
+            # Cada frame retiene solo un iterador; no expande un DAG ni copia
+            # los hijos de una colección ancha para recorrerla.
+            stack = [[obj, iter(obj), 1, 1]]
+            while stack:
+                frame = stack[-1]
+                check(frame[2], max(frame[3], len(stack)))
+                try:
+                    child = next(frame[1])
+                except StopIteration:
+                    metric = (frame[0], frame[2], frame[3])
+                    self._hash_costs[id(frame[0])] = metric
+                    stack.pop()
+                    if stack:
+                        stack[-1][2] += metric[1]
+                        stack[-1][3] = max(stack[-1][3], metric[2] + 1)
+                    continue
+                child_metric = known(child)
+                if child_metric is None:
+                    stack.append([child, iter(child), 1, 1])
+                else:
+                    frame[2] += child_metric[1]
+                    frame[3] = max(frame[3], child_metric[2] + 1)
+        check(metric[1], metric[2])
+        self._hash_remaining -= metric[1]
+
+    def _set_dict_item(self, result: dict, key: Any, value: Any) -> None:
+        self._check_hash_work(key)
+        result[key] = value
+
+    def _resolve_enum(self, cls: Type[Enum], value: Any) -> Any:
+        """Resolve members without Enum.__new__ rendering rejected values.
+
+        Catching ValueError after cls(value) is too late: stdlib has already
+        expanded repr(value), possibly exponentially through shared refs.
+        Registered _missing_ hooks remain trusted user code. A metaclass
+        __call__ is not a member-deserialization hook.
+        """
+        if type(value) is cls:
+            return value
+        self._check_hash_work(value)
+        try:
+            return cls._value2member_map_[value]
+        except KeyError:
+            pass
+        except TypeError:
+            # Python 3.13+ supports unhashable value aliases separately.
+            for name, values in getattr(cls, '_unhashable_values_map_', {}).items():
+                if value in values:
+                    return cls._member_map_[name]
+            for member in cls._member_map_.values():
+                if member._value_ == value:
+                    return member
+        if not cls._member_map_:
+            raise MSCDecodeError('Enum sin miembros en ' + self._path_str())
+        missing = cls._missing_
+        function = getattr(missing, '__func__', missing)
+        flag_hooks = (_enum.Flag._missing_.__func__, _enum.IntFlag._missing_.__func__)
+        # Builtin Flag hooks also use repr(value) when it is not an integer.
+        if function in flag_hooks and not isinstance(value, int):
+            raise MSCDecodeError('Valor no entero para Flag en ' + self._path_str())
+        result = missing(value)
+        if isinstance(result, cls):
+            return result
+        eject = getattr(_enum, 'EJECT', None)
+        if (eject is not None and issubclass(cls, _enum.Flag)
+                and getattr(cls, '_boundary_', None) is eject
+                and isinstance(result, int)):
+            return result
+        # Neither the input nor an invalid hook result is formatted here.
+        if result is None:
+            raise MSCDecodeError('Valor Enum no reconocido en ' + self._path_str())
+        raise MSCDecodeError('_missing_ de Enum devolvió un tipo inválido en ' + self._path_str())
 
     def decode(self) -> Any:
         self.depth += 1
@@ -1059,8 +1187,8 @@ class _Decoder:
                     f"Enum value referencia un contenedor en construcción "
                     f"en {self._path_str()} — payload corrupto o forjado"
                 )
-            if self.strict:
-                cls = _get_registered(class_path)
+            cls = _get_registered(class_path) if self.strict else _registry.get(class_path)
+            if cls is not None:
                 # El tag ENUM solo debe reconstruir Enums. Sin este chequeo,
                 # un payload puede apuntar a CUALQUIER clase registrada y
                 # forzar cls(value) con value del atacante — confusión de
@@ -1070,7 +1198,7 @@ class _Decoder:
                         f"Tag ENUM referencia clase no-Enum: {class_path!r}. "
                         f"Posible confusión de tipos."
                     )
-                return cls(value)
+                return self._resolve_enum(cls, value)
             else:
                 return {'__enum__': class_path, '__value__': value}
 
@@ -1143,6 +1271,7 @@ class _Decoder:
                         f"frozenset referencia un contenedor en construcción en "
                         f"{self._path_str()} — payload corrupto o forjado"
                     )
+                self._check_hash_work(item)
                 items.append(item)
             result = frozenset(items)
             self._resolve_ref(ref_id, result)
@@ -1160,6 +1289,7 @@ class _Decoder:
                         f"construcción en {self._path_str()} — payload "
                         f"corrupto o forjado"
                     )
+                self._check_hash_work(item)
                 result.add(item)
             return result
 
@@ -1167,7 +1297,7 @@ class _Decoder:
             n = self._read_length()
             result = {}
             self._store_ref(result)
-            for _ in range(n):
+            for i in range(n):
                 k = self.decode()
                 if type(k) is _Pending:
                     raise MSCDecodeError(
@@ -1175,12 +1305,12 @@ class _Decoder:
                         f"construcción en {self._path_str()} — payload "
                         f"corrupto o forjado"
                     )
-                self.path.append(f'.{k!r}' if isinstance(k, str) else f'[{k!r}]')
+                self.path.append(f'[item {i}]')
                 v = self.decode()
                 self.path.pop()
-                result[k] = v
+                self._set_dict_item(result, k, v)
                 if type(v) is _Pending:
-                    self._defer(v, lambda val, c=result, key=k: c.__setitem__(key, val))
+                    self._defer(v, lambda val, c=result, key=k: self._set_dict_item(c, key, val))
             return result
 
         if tag == _NDARRAY:
@@ -1205,15 +1335,19 @@ class _Decoder:
             parts = meta.split('|')
             dtype_str, shape_str = parts[0], parts[1]
             requires_grad = parts[2] == '1' if len(parts) > 2 else False
-            if not _is_safe_dtype(dtype_str):
+            if dtype_str != 'bfloat16' and not _is_safe_dtype(dtype_str):
                 raise MSCSecurityError(
                     f"tensor dtype no permitido: {dtype_str!r}"
                 )
             shape = self._parse_shape(shape_str)
             n = self._read_length(MAX_SIZE)
             raw = self._read(n)
-            arr = _np.frombuffer(raw, dtype=_np.dtype(dtype_str)).copy().reshape(shape)
-            t = _torch.from_numpy(arr)
+            if dtype_str == 'bfloat16':
+                arr = _np.frombuffer(raw, dtype=_np.dtype('<i2')).astype(_np.int16, copy=True).reshape(shape)
+                t = _torch.from_numpy(arr).view(_torch.bfloat16)
+            else:
+                arr = _np.frombuffer(raw, dtype=_np.dtype(dtype_str)).copy().reshape(shape)
+                t = _torch.from_numpy(arr)
             if requires_grad:
                 t = t.requires_grad_(True)
             return self._store_ref(t)
@@ -1289,7 +1423,8 @@ class _Decoder:
                     f"El estado de {class_path} referencia un contenedor "
                     f"en construcción en {self._path_str()} — irresoluble"
                 )
-            if '__setstate__' in type(obj).__dict__ or any(
+            generated_state = _generated_dataclass_state(cls)
+            if not generated_state and any(
                 '__setstate__' in c.__dict__ for c in type(obj).__mro__[:-1]
                 if c is not object
             ):
@@ -1309,17 +1444,24 @@ class _Decoder:
                 # Un valor pendiente NUNCA se asigna: la primera (y única)
                 # asignación la hace el fix-up con el valor real, para que
                 # descriptors/__setattr__ de usuario jamás vean el sentinela.
-                # Las claves se filtran contra los fields declarados (fail-
+                # Las claves se filtran contra fields y slots declarados (fail-
                 # closed): una clave espuria del payload no es un field, y sin
                 # este filtro '__dict__' reemplazaría el dict de instancia
                 # entero (clobbering/aliasing) y el nombre de una @property
                 # invocaría su setter con datos del atacante — fuera del modelo
                 # "solo __setstate__ se ejecuta". Paridad con la rama slots.
-                field_names = {f.name for f in dataclasses.fields(cls)}
+                fields = [f.name for f in dataclasses.fields(cls)]
+                # Compatibilidad con listas field-only escritas por 2.5.1
+                # para dataclasses frozen+slots con hooks autogenerados.
+                if generated_state and type(state) in (list, tuple):
+                    if len(state) != len(fields):
+                        raise MSCDecodeError('Estado legacy de dataclass tiene longitud inválida')
+                    state = dict(zip(fields, state))
+                field_names = set(fields).union(_collect_slot_names(cls))
                 for k, v in state.items():
-                    if k not in field_names:
+                    if type(k) is not str or k not in field_names:
                         raise MSCDecodeError(
-                            f"Clave '{k}' no es un field de la dataclass "
+                            f"Clave de estado no es un field ni slot de la dataclass "
                             f"{class_path} en {self._path_str()} — payload "
                             f"manipulado"
                         )
@@ -1422,7 +1564,8 @@ def dumps(obj: Any, *, with_crc: bool = False,
 def loads(data: bytes, *, strict: bool = True,
           hmac_key: Optional[bytes] = None,
           max_size: Optional[int] = None,
-          max_depth: Optional[int] = None) -> Any:
+          max_depth: Optional[int] = None,
+          max_hash_work: Optional[int] = None) -> Any:
     """
     Deserializa bytes a objeto.
 
@@ -1436,6 +1579,10 @@ def loads(data: bytes, *, strict: bool = True,
               no confiable (el pico de memoria es un múltiplo por el overhead
               de objetos Python).
     max_depth: profundidad máxima de anidamiento (default MAX_DEPTH).
+    max_hash_work: presupuesto acumulado de hash (default MAX_HASH_WORK).
+                   Cuenta nodos expandidos de tuples/frozensets y un nodo
+                   por clave/item escalar. No limita métodos de clases
+                   registradas ni el coste de colisiones de hash.
 
     max_size y max_depth son los knobs soportados; reasignar mscs.MAX_SIZE /
     mscs.MAX_DEPTH no tiene efecto (son nombres re-exportados, no los globals
@@ -1471,7 +1618,7 @@ def loads(data: bytes, *, strict: bool = True,
         buf.seek(5)
         # Respeta el strict del llamante: forzar strict=False sería otro
         # downgrade silencioso de la política de seguridad solicitada.
-        dec = _Decoder(buf, strict=strict, max_depth=max_depth)
+        dec = _Decoder(buf, strict=strict, max_depth=max_depth, max_hash_work=max_hash_work)
         result = dec.assert_fully_resolved(dec.decode())
         # Trailing bytes: mismo control que la rama v2 (paridad de versión).
         # v1 no tiene CRC/HMAC in-band, así que el payload real acaba en
@@ -1530,7 +1677,7 @@ def loads(data: bytes, *, strict: bool = True,
 
     buf = io.BytesIO(decode_data)
     buf.seek(6)  # skip header
-    dec = _Decoder(buf, strict=strict, max_depth=max_depth)
+    dec = _Decoder(buf, strict=strict, max_depth=max_depth, max_hash_work=max_hash_work)
     result = dec.assert_fully_resolved(dec.decode())
 
     # ── Validar que no hay trailing bytes ──
@@ -1555,7 +1702,8 @@ def dump(obj: Any, file, *, with_crc: bool = False,
 def load(file, *, strict: bool = True,
          hmac_key: Optional[bytes] = None,
          max_size: Optional[int] = None,
-         max_depth: Optional[int] = None) -> Any:
+         max_depth: Optional[int] = None,
+         max_hash_work: Optional[int] = None) -> Any:
     """Deserializa desde archivo (modo binario).
 
     Lee como máximo max_size+1 bytes: un archivo mayor se rechaza sin
@@ -1569,7 +1717,7 @@ def load(file, *, strict: bool = True,
             f"Sube max_size si el dato es confiable."
         )
     return loads(data, strict=strict, hmac_key=hmac_key,
-                 max_size=size_limit, max_depth=max_depth)
+                 max_size=size_limit, max_depth=max_depth, max_hash_work=max_hash_work)
 
 
 def dump_compressed(obj: Any, file, level: int = 6, **kwargs) -> None:

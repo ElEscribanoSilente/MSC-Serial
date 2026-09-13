@@ -39,6 +39,7 @@ from mscs._core import (
     MAX_COLLECTION,
     MAX_STRING,
     MAX_INT_BYTES,
+    MAX_HASH_WORK,
 )
 
 __all__ = [
@@ -48,5 +49,5 @@ __all__ = [
     "register", "register_alias", "register_module",
     "inspect", "benchmark", "copy",
     "MSCError", "MSCEncodeError", "MSCDecodeError", "MSCSecurityError",
-    "MAX_INT_BYTES",
+    "MAX_INT_BYTES", "MAX_HASH_WORK",
 ]

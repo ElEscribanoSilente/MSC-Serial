@@ -1,289 +1,174 @@
-# MSCS — Safe Serialization for Python
+# MSC Serial (mscs)
 
-**v2.5.0** | [Changelog](CHANGELOG.md) | [PyPI](https://pypi.org/project/mscs/)
+Binary serialization for Python with explicit class registration, optional
+HMAC-SHA256 authentication, and NumPy/PyTorch support.
 
-> **Status: Beta** — API is stable but the format may evolve. Not yet battle-tested in large-scale production.
+Version **2.6.0** · Python **3.9+** · MIT license
 
-A secure, fast, binary serialization library. Drop-in replacement for `pickle` that **does not execute arbitrary code** during deserialization of unregistered classes.
-
-Built for AI/ML workflows — native support for **NumPy arrays** and **PyTorch tensors** with zero-copy performance.
-
-## Why not pickle?
-
-```python
-# pickle: arbitrary code execution on load
-data = pickle.loads(untrusted_bytes)  # can run os.system("rm -rf /")
-
-# mscs: only reconstructs explicitly registered classes
-data = mscs.loads(untrusted_bytes)    # MSCSecurityError if class not registered
-```
-
-## Comparison with Alternatives
-
-| Feature | mscs | pickle | safetensors | torch.save |
-|---------|------|--------|-------------|------------|
-| No arbitrary code execution | Partial* | No | Yes | No |
-| HMAC authentication | Yes | No | No | No |
-| Custom class support | Yes (registry) | Yes | No | Yes |
-| NumPy arrays | Yes | Yes | Yes | Yes |
-| PyTorch tensors | Yes | Yes | Yes | Yes |
-| Circular references | Yes | Yes | No | Yes |
-| Zero dependencies | Yes | Yes | Yes (Rust) | No |
-| Compression built-in | Yes (zlib) | No | No | No |
-
-\* **mscs executes `__setstate__`** on registered classes. See [Security Model](#security-model) for details.
-
-**When to use safetensors instead:** If you only need to serialize tensors and arrays (model weights, embeddings), [safetensors](https://github.com/huggingface/safetensors) is the industry standard — it's written in Rust, truly zero-code-execution, and widely adopted. Use mscs when you need to serialize **mixed Python objects** (configs, custom classes, nested structures) alongside tensors.
+MSCS supports primitive values, containers, shared references, many cyclic
+graphs, registered classes and dataclasses. It uses its own wire format;
+it cannot read pickle files or implement every pickle protocol feature.
 
 ## Install
 
 ```bash
-pip install mscs              # core (no dependencies)
-pip install mscs[numpy]       # + numpy support
-pip install mscs[torch]       # + numpy + PyTorch tensor support
-pip install mscs[all]         # everything
+python -m pip install mscs
+python -m pip install "mscs[numpy]"  # NumPy >=1.20
+python -m pip install "mscs[torch]"  # NumPy >=1.20 and PyTorch >=2.8
 ```
 
-## Quick Start
+The base package has no mandatory runtime dependencies. Optional dependency
+versions must also support your Python version and platform.
+
+## Quick start
 
 ```python
 import mscs
 
-# Primitives, collections, nested structures — just works
-data = {"model": "v5.2", "lr": 0.001, "layers": [64, 128, 256]}
-encoded = mscs.dumps(data)
-decoded = mscs.loads(encoded)
+data = {"name": "example", "values": [1, 2, 3]}
+blob = mscs.dumps(data)
+assert mscs.loads(blob) == data
 
-# NumPy arrays
-import numpy as np
-arr = np.random.randn(100, 100).astype(np.float32)
-encoded = mscs.dumps(arr)
-
-# PyTorch tensors — no .numpy() conversion needed
-import torch
-weights = torch.randn(256, 256)
-encoded = mscs.dumps(weights)  # safe, no pickle involved
-
-# Full model checkpoints
-checkpoint = {
-    "epoch": 100,
-    "model_state": {k: v for k, v in model.state_dict().items()},
-    "optimizer_lr": 0.0003,
-}
-mscs.dump(checkpoint, open("checkpoint.mscs", "wb"))
-restored = mscs.load(open("checkpoint.mscs", "rb"))
+with open("example.msc", "wb") as file:
+    mscs.dump(data, file)
+with open("example.msc", "rb") as file:
+    restored = mscs.load(file)
 ```
 
-## Custom Classes
+Register only classes whose reconstruction code you trust:
 
 ```python
-import mscs
 from dataclasses import dataclass
+import mscs
 
 @mscs.register
 @dataclass
-class Config:
-    state_size: int = 256
-    lr: float = 0.001
+class Point:
+    x: float
+    y: float
 
-config = Config(512, 0.0003)
-data = mscs.dumps(config)
-restored = mscs.loads(data)  # Config(state_size=512, lr=0.0003)
-
-# Unregistered classes raise MSCSecurityError in strict mode
-mscs.loads(data_with_unknown_class)  # MSCSecurityError
-
-# Or get a dict fallback in non-strict mode
-mscs.loads(data_with_unknown_class, strict=False)  # {'__class__': '...', '__state__': {...}}
+point = mscs.loads(mscs.dumps(Point(1.0, 2.0)))
+assert isinstance(point, Point)
 ```
 
-### Backward Compatibility with Renamed Classes
+Classes are identified by module and qualified name. Keep those names stable
+across producer and consumer; use `register_alias(old_name, cls)` for migrations.
+Enums also require registration to restore their class identity.
+
+## Authentication and limits
 
 ```python
-mscs.register_alias("my_module.OldConfig", Config)
+import secrets
+import mscs
+
+key = secrets.token_bytes(32)  # Example: securely share/persist your real key.
+signed = mscs.dumps({"value": 42}, hmac_key=key)
+value = mscs.loads(
+    signed,
+    hmac_key=key,
+    max_size=8 * 1024 * 1024,
+    max_depth=64,
+    max_hash_work=100_000,
+)
 ```
 
-### Register All Classes in a Module
+Providing `hmac_key` on load requires a valid signature and rejects unsigned
+v2 and legacy v1 input. Authentication is checked before object reconstruction.
+For compressed files, bounded decompression precedes authentication of the
+inner message. HMAC does not encrypt data. `with_crc=True` detects accidental
+corruption; CRC is not authentication and cannot be combined with `hmac_key`.
+
+| Load option | Default | Meaning |
+| --- | --- | --- |
+| `strict` | `True` | Reject unregistered classes; `False` returns fallback data for them. |
+| `max_size` | 512 MiB | Maximum encoded message size, including framing. |
+| `max_depth` | 256 | Maximum nesting depth; also available on encoding. |
+| `max_hash_work` | 1,000,000 | Cumulative expanded builtin hash work for keys, set items and Enum values. |
+
+Use per-call options; rebinding exported `MAX_*` constants does not change the
+decoder defaults. Python object overhead can make memory usage substantially
+larger than `max_size`. Hash work limits do not bound collision costs, equality
+comparisons or registered class methods. For hostile workloads, also impose
+process memory and execution-time limits appropriate to your application.
+
+The registry is a trust boundary, not a sandbox. Reconstruction may execute
+registered `__new__`, `__setstate__`, attribute descriptors, hash/equality
+methods and Enum `_missing_` hooks. `strict=False` does not disable registered
+class hooks. MSCS does not import arbitrary classes named by a payload, but
+registering a class explicitly authorizes its reconstruction behavior.
+
+## Arrays, tensors and object state
 
 ```python
-import my_models
-mscs.register_module(my_models)
+import numpy as np
+import mscs
+
+array = np.arange(12, dtype=np.float32).reshape(3, 4)
+assert np.array_equal(mscs.loads(mscs.dumps(array)), array)
 ```
 
-## Compression & Integrity
+Numeric and boolean NumPy dtypes are supported; object, structured, void and
+string dtypes are rejected. Arrays are reconstructed into copied buffers.
+Dense PyTorch tensors are serialized through CPU storage, including `bfloat16`
+and resolved conjugate/negative views. Restored tensors are on CPU; device
+placement, storage views and autograd graphs are not preserved. The
+`requires_grad` flag is retained where the dtype supports it.
 
-```python
-# zlib compression
-with open("data.mscs.z", "wb") as f:
-    mscs.dump_compressed(large_obj, f)
+Dataclass fields, inherited/private slots and unset slots are handled explicitly.
+Shared references and supported cycles preserve identity. Cycles that require
+passing unresolved tuple state into an opaque `__setstate__` fail with
+`MSCDecodeError`; use a mutable container to break that reconstruction dependency.
 
-with open("data.mscs.z", "rb") as f:
-    obj = mscs.load_compressed(f)
+## API
 
-# CRC32 integrity check (detects accidental corruption, NOT tamper-proof)
-data = mscs.dumps(obj, with_crc=True)
-mscs.loads(data)  # verifies CRC, raises MSCDecodeError if corrupted
+| Function | Purpose |
+| --- | --- |
+| `dumps(obj, **options)` / `loads(blob, **options)` | Encode/decode bytes. |
+| `dump(obj, file, **options)` / `load(file, **options)` | Use an open binary file. |
+| `dump_compressed(obj, file, level=6, **options)` / `load_compressed(file, **options)` | Use a bounded zlib container around an MSCS message. |
+| `register(cls)` / `register_alias(name, cls)` | Allow a class or its former wire name. |
+| `register_module(module)` | Register classes from a trusted module; review what it exposes. |
+| `copy(obj)` | Round-trip a trusted object with non-strict fallback behavior. |
+| `inspect(blob)` | Read basic framing metadata; does not authenticate or validate the entire message. |
+| `benchmark(obj, rounds=100)` | Run the included local serialization benchmark. |
 
-# HMAC-SHA256 authentication (cryptographic, tamper-proof)
-key = b'your-secret-key-here'
-data = mscs.dumps(obj, hmac_key=key)
-mscs.loads(data, hmac_key=key)          # verifies HMAC, raises MSCSecurityError if tampered
-mscs.loads(data)                         # MSCSecurityError: no key provided for signed payload
-mscs.loads(unsigned_data, hmac_key=key)  # MSCSecurityError: anti-downgrade protection
+Encoding options are `with_crc`, `hmac_key` and `max_depth`. Decoding options
+are `strict`, `hmac_key`, `max_size`, `max_depth` and `max_hash_work`.
+Catch `MSCError` for library errors, or its subclasses `MSCEncodeError`,
+`MSCDecodeError` and `MSCSecurityError` for more specific handling.
+
+## Upgrading to 2.6
+
+- Readers continue to accept supported v1/v2 messages, subject to authentication
+  and resource limits. Wire v2 remains the writer's version.
+- New field-and-slot dataclass states and `bfloat16` metadata require 2.6 readers.
+  Upgrade consumers before writing those forms. Field-only frozen slotted
+  dataclasses keep their existing list state representation.
+- Primitive-backed Enums now retain their registered type. Older messages
+  that stored them as scalars cannot recover the original Enum class.
+- Invalid Enum values produce bounded builtin diagnostics. Stored members and
+  registered `_missing_` hooks are used for resolution; custom Enum metaclass
+  `__call__` is not a deserialization hook.
+- The new hash work budget may reject large legitimate hashed graphs; choose
+  an explicit budget after measuring your workload. PyTorch extras now require 2.8+.
+
+See the [changelog](https://github.com/ElEscribanoSilente/MSC-Serial/blob/main/CHANGELOG.md)
+for the complete release history.
+
+## Development
+
+```bash
+python -m pip install -e ".[test]"
+python -m pytest -q
+python tests/security_audit.py
 ```
 
-## API Reference
+Install `.[all,test]` to exercise the optional array and tensor tests. The CI
+configuration targets Python 3.9–3.14 on Linux and Windows, with separate base
+and optional dependency jobs. The suite includes mutation, authentication,
+resource-limit and object graph regressions. Passing tests does not establish
+absence of other defects.
 
-### Core
-
-| Function | Description |
-|----------|------------|
-| `dumps(obj, *, with_crc=False, hmac_key=None) -> bytes` | Serialize to bytes |
-| `loads(data, *, strict=True, hmac_key=None) -> Any` | Deserialize from bytes |
-| `dump(obj, file, *, with_crc=False, hmac_key=None)` | Serialize to file (binary mode) |
-| `load(file, *, strict=True, hmac_key=None) -> Any` | Deserialize from file |
-| `dump_compressed(obj, file, level=6)` | Serialize with zlib compression |
-| `load_compressed(file) -> Any` | Deserialize compressed data |
-
-### Registry
-
-| Function | Description |
-|----------|------------|
-| `register(cls) -> cls` | Register class as safe (also works as decorator) |
-| `register_alias(old_path, cls)` | Map old class path to new class |
-| `register_module(module) -> list` | Register all classes in a module |
-
-### Utilities
-
-| Function | Description |
-|----------|------------|
-| `inspect(data) -> dict` | Get metadata without deserializing |
-| `benchmark(obj, rounds=100) -> dict` | Measure encode/decode performance |
-| `copy(obj) -> obj` | Deep copy via serialization round-trip |
-
-## Supported Types
-
-| Type | Notes |
-|------|-------|
-| `None`, `bool`, `int`, `float`, `complex` | Ints up to 8192 bytes (~19,700 digits) |
-| `str`, `bytes`, `bytearray` | UTF-8, ref-tracked |
-| `list`, `tuple`, `dict`, `set`, `frozenset`, `deque` | Circular refs supported (including cycles through tuples); `deque` preserves `maxlen` |
-| `datetime`, `date`, `time`, `timedelta` | ISO 8601 |
-| `Decimal`, `UUID`, `Path` | Lossless |
-| `Enum` | Must be registered |
-| `numpy.ndarray` | dtype whitelist enforced |
-| `torch.Tensor` | Auto CPU transfer, preserves requires_grad |
-| `dataclass` (incl. `frozen`), `__slots__`, `__dict__` objects | Must be registered; circular refs supported (self/mutual references, cycles through tuples). `__slots__` handled in full: string form, inheritance, private (name-mangled) slots, and hybrid slots+`__dict__` classes. One exception fails closed: a custom `__setstate__` whose state contains a reference to a tuple still under construction raises `MSCDecodeError` — break such cycles through a mutable container |
-
-## Performance
-
-Benchmarked on a single machine (results may vary by hardware and payload):
-
-**Payload: `state_dict` with 4 tensors (~57K parameters, dominated by contiguous float32 buffers):**
-
-| Method | Roundtrip | Size |
-|--------|-----------|------|
-| **mscs** | **~0.1 ms** | **~65 KB** |
-| pickle | ~0.6 ms | ~68 KB |
-| torch.save | ~0.4 ms | ~67 KB |
-
-mscs is fast for tensor-heavy payloads because it writes raw buffers with minimal framing overhead. **For small, nested Python structures (dicts, strings, configs), the speedup is smaller.** Always benchmark with your actual data.
-
-Run `python tests/benchmark.py` to reproduce on your machine.
-
-## Security Model
-
-mscs provides a **defense-in-depth** approach, but it is **not a sandbox**. Understand the boundaries:
-
-### What mscs prevents
-
-1. **No dynamic imports**: Class names in the binary stream are only used as registry lookup keys — never passed to `importlib`
-2. **Explicit registry**: Custom classes must be registered before deserialization; unregistered classes raise `MSCSecurityError`
-3. **NumPy dtype whitelist**: Blocks `object`, `void`, and structured dtypes that could execute code
-4. **Total-size and depth limits**: `loads()`/`load()` reject any blob larger than `max_size` (default `MAX_SIZE=512MB`) **before decoding** — this bounds the *sum* of all fields, not just each field individually (every decoded string/collection lives inside the input). The limit is on the whole encoded blob (data + framing), so the largest round-trippable single field is slightly below `max_size`; pass a larger `max_size` to load trusted data at that edge. `load()` reads at most `max_size+1` bytes, so an oversized file is never materialized. Other per-field caps: `MAX_COLLECTION=10M` elements per collection, `MAX_STRING=100MB` per string/bytes, `MAX_INT_BYTES=8192`, `MAX_DEPTH=256` nesting. Peak memory is a **multiple** of `max_size` (Python object overhead is ~6× for tiny primitives, plus transient copies during decompression), so set `max_size` conservatively for untrusted input — e.g. `loads(data, max_size=50*1024*1024)`
-5. **Anti zip-bomb**: `load_compressed` bounds **both** the compressed read and the decompressed output to `max_size` (the compressed read additionally capped by `MAX_COMPRESSED`) and decompresses **incrementally**, aborting the moment the output crosses the limit — a bomb cannot exhaust memory before the size check, and lowering `max_size` lowers peak memory on both sides
-6. **Compressed-container integrity**: `load_compressed` verifies the zlib stream ended cleanly (checksum validated), rejects trailing bytes and concatenated streams, and checks the decompressed length against the declared header — a truncated, forged, or padded container fails closed with `MSCDecodeError` instead of yielding partial data
-7. **Path null byte rejection**: Paths containing null bytes are rejected
-8. **CRC32 corruption detection**: Optional checksum to detect accidental data corruption (not cryptographic — an attacker can forge CRC32)
-9. **HMAC-SHA256 authentication**: Optional cryptographic signature to detect intentional tampering. Anti-downgrade protection rejects any payload lacking a valid HMAC when a key is supplied — including the legacy **v1** format — so an attacker cannot strip or version-downgrade the signature.
-10. **Trailing bytes rejection**: Payloads with unexpected bytes after the serialized object are rejected
-11. **Integer size limit**: Ints larger than `MAX_INT_BYTES` (8192 bytes, ~19,700 digits) are rejected to prevent CPU exhaustion attacks
-12. **Forged forward-ref rejection**: Payloads referencing a container still under construction from an unpatchable position (dict key, set/frozenset member, self-referential root tuple) fail closed with `MSCDecodeError` — and `loads()` verifies no unresolved placeholder survives decoding. The encoder can never produce these shapes
-
-### What mscs does NOT prevent
-
-1. **`__setstate__` execution**: If you register a class that implements `__setstate__`, that method **will execute** during deserialization. Only register classes you trust.
-2. **Path traversal**: Deserialized `Path` objects may contain `../` sequences. The consumer must validate paths before using them for file I/O.
-3. **Malicious registered classes**: The security boundary is the registry. If you register a class with dangerous behavior in `__init__`, `__setstate__`, or property setters, mscs cannot protect you.
-4. **Bounded-but-not-tiny memory**: the size limit bounds the input, but peak memory is a multiple of it — decoding expands compact bytes into Python objects (~6× for tiny primitives), and decompression holds transient copies. Budget for a few times `max_size`, and lower `max_size` for untrusted input.
-
-### Configuring limits
-
-Pass `max_size` / `max_depth` per call — these are the supported, thread-safe knobs:
-
-```python
-obj = mscs.loads(untrusted, max_size=50 * 1024 * 1024, max_depth=64)
-mscs.dumps(obj, max_depth=64)
-```
-
-> **Note:** rebinding the module constant (`mscs.MAX_DEPTH = 1`) has **no effect** — it is a re-exported name, not the global the encoder/decoder read. Use the parameters above.
-
-**Rule of thumb**: mscs is safe for deserializing untrusted *data* as long as your registry only contains trusted *classes* and you set `max_size` to fit your memory budget.
-
-## Binary Format
-
-```
-┌──────────┬─────────┬───────┬──────────┬────────────────┬──────────────┬──────────────┐
-│ Magic(4) │ Ver.(1) │ Fl(1) │ Tag(1)   │ Payload(var)   │ CRC32(4)?    │ HMAC(32)?    │
-│ "MSCS"   │ 0x02    │ bits  │ type tag │ type-dependent  │ if flag 0x01 │ if flag 0x02 │
-└──────────┴─────────┴───────┴──────────┴────────────────┴──────────────┴──────────────┘
-```
-
-**Header** (6 bytes fixed):
-- Bytes 0-3: Magic `MSCS` (0x4D534353)
-- Byte 4: Format version (currently `0x02`)
-- Byte 5: Flags (bit 0 = CRC32 appended, bit 1 = HMAC-SHA256 appended)
-
-CRC32 and HMAC are mutually exclusive (HMAC is strictly superior).
-
-**Payload**: Recursive type-length-value encoding. Each value starts with a 1-byte type tag:
-
-| Tag | Type | Payload format |
-|-----|------|----------------|
-| 0x00 | None | (empty) |
-| 0x01 | bool | 1 byte (0x00/0x01) |
-| 0x02 | int | `<H>` byte count + signed little-endian bytes |
-| 0x03 | float | `<d>` IEEE 754 double |
-| 0x04 | str | `<I>` byte count + UTF-8 |
-| 0x05 | bytes | `<I>` byte count + raw |
-| 0x06 | list | `<I>` item count + items |
-| 0x07 | tuple | `<I>` item count + items |
-| 0x08 | dict | `<I>` pair count + key/value pairs |
-| 0x09 | set | `<I>` item count + items (sorted) |
-| 0x0A | ndarray | str(meta) + `<I>` data size + raw buffer |
-| 0x0B | object | str(class_path) + encoded(state) |
-| 0x0C | complex | `<dd>` real, imag |
-| 0x0D | frozenset | `<I>` item count + items (sorted) |
-| 0x0E | datetime | `<H>` str len + ISO 8601 string |
-| 0x0F | date | `<HBB>` year, month, day |
-| 0x10 | time | `<H>` str len + ISO 8601 string |
-| 0x11 | timedelta (legacy) | `<iiI>` days, seconds, microseconds |
-| 0x12 | Decimal | `<H>` str len + decimal string |
-| 0x13 | Enum | str(class_path) + encoded(value) |
-| 0x14 | bytearray | `<I>` byte count + raw |
-| 0x15 | ref | `<I>` reference ID |
-| 0x16 | UUID | 16 bytes raw |
-| 0x17 | Path | `<I>` str len + UTF-8 path string |
-| 0x18 | Tensor | str(meta) + `<I>` data size + raw buffer |
-| 0x19 | timedelta2 | `<iiI>` days, seconds, microseconds |
-| 0x1A | deque | `<i>` maxlen (-1 if None) + `<I>` item count + items |
-
-**ndarray meta**: `"{dtype}|{shape}"` where shape is `"dim0xdim1x..."` (e.g., `"float32|100x100"`).
-
-**Tensor meta**: `"{dtype}|{shape}|{requires_grad}"` (e.g., `"float32|256x256|0"`).
-
-**Reference tracking**: Mutable containers (list, dict, set, etc.), strings, bytes, and arrays are assigned incrementing IDs. Tag 0x15 refers back to a previously seen object by ID, enabling circular reference support.
-
-## License
-
-MIT
+[Release instructions](https://github.com/ElEscribanoSilente/MSC-Serial/blob/main/RELEASING.md)
+· [Security policy](https://github.com/ElEscribanoSilente/MSC-Serial/blob/main/SECURITY.md)
+· [License](https://github.com/ElEscribanoSilente/MSC-Serial/blob/main/LICENSE)

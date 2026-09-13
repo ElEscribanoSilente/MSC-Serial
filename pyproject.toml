@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mscs"
-version = "2.5.1"
-description = "Safe, fast serialization for Python — a secure replacement for pickle with HMAC authentication, native numpy/PyTorch support."
+version = "2.6.0"
+description = "Binary serialization with explicit class registration, HMAC authentication and optional NumPy/PyTorch support."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
@@ -29,6 +29,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Security",
@@ -37,8 +38,8 @@ classifiers = [
 
 [project.optional-dependencies]
 numpy = ["numpy>=1.20"]
-torch = ["numpy>=1.20", "torch>=2.0"]
-all = ["numpy>=1.20", "torch>=2.0"]
+torch = ["numpy>=1.20", "torch>=2.8"]
+all = ["numpy>=1.20", "torch>=2.8"]
 test = ["pytest>=7.0", "hypothesis>=6.0"]
 
 [project.urls]
@@ -48,7 +49,10 @@ Issues = "https://github.com/ElEscribanoSilente/MSC-Serial/issues"
 Changelog = "https://github.com/ElEscribanoSilente/MSC-Serial/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.sdist]
-include = ["src/mscs/"]
+include = ["src/mscs/", "tests/", "README.md", "CHANGELOG.md", "LICENSE", "pyproject.toml", "RELEASING.md", "SECURITY.md", ".gitignore", "scripts/"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mscs"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
